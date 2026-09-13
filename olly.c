@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,7 +51,10 @@ struct editorConfig {
   int screenrows;
   int screencols;
   int numrows;
+  int rowcap;         /* allocated capacity of row[], grown by doubling */
   int dirty;
+  int eol_crlf;       /* write \r\n line endings, as the loaded file used */
+  int final_newline;  /* the file ended with a newline (so the save should) */
   erow *row;
   char *filename;
   char statusmsg[128];
@@ -95,6 +99,7 @@ struct abuf {
 
 void die(const char *s);
 void editor_set_status_message(const char *fmt, ...);
+void write_recovery_file(void);
 
 /* Make room for `extra` more bytes. Capacity doubles, so a frame costs a few
  * reallocs in total; growing by exactly the appended length cost one realloc
@@ -123,6 +128,7 @@ static void ab_append_fill(struct abuf *ab, char c, int n) {
 }
 
 void die(const char *s) {
+  write_recovery_file();
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
   perror(s);
@@ -148,6 +154,48 @@ static char *xstrdup(const char *s) {
   char *p = strdup(s);
   if (p == NULL) die("strdup");
   return p;
+}
+
+/* --- UTF-8: the buffer holds raw bytes, but the cursor moves and deletes by
+ * whole characters, so editing never splits a multibyte sequence and leaves
+ * invalid bytes behind. (On-screen column width for wide or combining glyphs
+ * is not yet modelled; a character is treated as one display column.) --- */
+
+static int utf8_is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
+
+/* Bytes in the character starting at index i, validated: a lead byte whose
+ * continuation bytes are missing or wrong is treated as a single byte. */
+static int utf8_char_bytes(const char *s, int size, int i) {
+  if (i < 0 || i >= size) return 1;
+  unsigned char c = (unsigned char)s[i];
+  int n;
+  if (c >= 0xF0) n = 4;
+  else if (c >= 0xE0) n = 3;
+  else if (c >= 0xC0) n = 2;
+  else return 1;
+  if (i + n > size) return 1;
+  int k;
+  for (k = 1; k < n; k++)
+    if (!utf8_is_cont((unsigned char)s[i + k])) return 1;
+  return n;
+}
+
+/* Start index of the character before index i. */
+static int utf8_prev(const char *s, int i) {
+  if (i <= 0) return 0;
+  int j = i - 1;
+  while (j > 0 && utf8_is_cont((unsigned char)s[j])) j--;
+  return j;
+}
+
+/* Number of characters in s[0..size). */
+static int utf8_strlen(const char *s, int size) {
+  int i = 0, n = 0;
+  while (i < size) {
+    i += utf8_char_bytes(s, size, i);
+    n++;
+  }
+  return n;
 }
 
 /* --- saved-content snapshot: the buffer is only "modified" when it really
@@ -294,6 +342,40 @@ int write_all(int fd, const void *p0, size_t n) {
   return 0;
 }
 
+/* --- crash recovery: when the editor is about to die with unsaved changes --
+ * a fatal signal, or an out-of-memory exit through die() -- the buffer is
+ * written to a side file so the work is not simply lost. The path is computed
+ * ahead of time, in normal context, because the signal path may run only
+ * async-signal-safe code. --- */
+
+static char recovery_path[4096];
+
+void build_recovery_path(void) {
+  if (E.filename != NULL)
+    snprintf(recovery_path, sizeof(recovery_path), "%s.olly-recover",
+        E.filename);
+  else
+    snprintf(recovery_path, sizeof(recovery_path), "olly-recover.%ld",
+        (long)getpid());
+}
+
+/* Best effort, and safe to call from a signal handler: only open/write/fsync/
+ * close and plain memory reads. Reading E.row while it is mid-mutation can at
+ * worst drop or duplicate a few bytes, which beats losing the whole buffer. */
+void write_recovery_file(void) {
+  if (!E.dirty || recovery_path[0] == '\0') return;
+  int fd = open(recovery_path,
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd == -1) return;
+  int j;
+  for (j = 0; j < E.numrows; j++) {
+    if (write_all(fd, E.row[j].chars, (size_t)E.row[j].size) == -1) break;
+    if (write_all(fd, "\n", 1) == -1) break;
+  }
+  fsync(fd);
+  close(fd);
+}
+
 /* Runs from atexit, where die() -- which calls exit() again -- would be
  * undefined behaviour. If the terminal is already gone there is nothing left
  * to restore anyway. */
@@ -307,6 +389,7 @@ void disable_raw_mode(void) {
  * Only async-signal-safe calls belong here. */
 static void handle_fatal_signal(int sig) {
   static const char reset[] = "\x1b[?25h\x1b[2J\x1b[H";
+  write_recovery_file();
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
   write(STDOUT_FILENO, reset, sizeof(reset) - 1);
   raise(sig);
@@ -452,6 +535,20 @@ void editor_update_row(erow *row) {
   for (j = 0; j < row->size; j++)
     if (row->chars[j] == '\t') tabs++;
 
+  /* With no tabs, render is byte-for-byte chars, so alias it rather than keep
+   * a second copy of every line. rcap > 0 marks an owned render buffer (always
+   * a distinct allocation); rcap == 0 marks an alias to chars -- or a stale
+   * pointer to a chars block a mutator just reallocated, which is why the
+   * alias case must never free it. editor_free_row keys off rcap the same way. */
+  if (tabs == 0) {
+    if (row->rcap > 0) free(row->render);
+    row->render = row->chars;
+    row->rsize = row->size;
+    row->rcap = 0;
+    return;
+  }
+
+  if (row->rcap == 0) row->render = NULL;
   {
     int need = row->size + tabs * (KILO_TAB_STOP - 1) + 1;
     if (row->rcap < need) {
@@ -475,13 +572,25 @@ void editor_update_row(erow *row) {
 
 void editor_insert_row(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
-  E.row = xrealloc(E.row, sizeof(erow) * (size_t)(E.numrows + 1));
+  /* Allocate the new row's text before touching the array. The memmove below
+   * duplicates each shifted row's pointers into the next slot for an instant;
+   * if an allocation failed after that and died, editor_cleanup would free
+   * the duplicated pointer twice. Allocating first means a failure here dies
+   * with the array still consistent. */
+  char *chars = xmalloc(len + 1);
+  memcpy(chars, s, len);
+  chars[len] = '\0';
+
+  /* Double the capacity when full, so loading an n-line file costs O(log n)
+   * reallocations rather than one per line. */
+  if (E.numrows == E.rowcap) {
+    E.rowcap = E.rowcap ? E.rowcap * 2 : 32;
+    E.row = xrealloc(E.row, sizeof(erow) * (size_t)E.rowcap);
+  }
   memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
 
   E.row[at].size = len;
-  E.row[at].chars = xmalloc(len + 1);
-  memcpy(E.row[at].chars, s, len);
-  E.row[at].chars[len] = '\0';
+  E.row[at].chars = chars;
   E.row[at].rsize = 0;
   E.row[at].render = NULL;
   E.row[at].rcap = 0;
@@ -492,7 +601,7 @@ void editor_insert_row(int at, char *s, size_t len) {
 }
 
 void editor_free_row(erow *row) {
-  free(row->render);
+  if (row->rcap > 0) free(row->render);  /* rcap > 0 => render is owned */
   free(row->chars);
 }
 
@@ -792,10 +901,14 @@ void editor_delete_char(void) {
   int pre_cx = E.cx, pre_cy = E.cy;
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
-    int at = E.cx - 1;
+    int at = utf8_prev(row->chars, E.cx);
+    int nbytes = E.cx - at;
     struct uchange *top = U.undo_n ? U.undo[U.undo_n - 1] : NULL;
-    if (!U.locked && top && top->kind == UC_DELETE && top->row == E.cy &&
-        top->at == E.cx && top->back) {
+    /* A run of single-byte backspaces coalesces into one undo step. A
+     * multibyte character is deleted as its own step -- simpler, and rare
+     * enough that grouping it buys little. */
+    if (nbytes == 1 && !U.locked && top && top->kind == UC_DELETE &&
+        top->row == E.cy && top->at == E.cx && top->back) {
       char *nt = xmalloc(top->len + 2);
       nt[0] = row->chars[at];
       memcpy(nt + 1, top->text, top->len);
@@ -807,7 +920,8 @@ void editor_delete_char(void) {
       top->cx1 = at;
       top->cy1 = E.cy;
     } else {
-      struct uchange *u = uc_new(UC_DELETE, E.cy, at, row->chars + at, 1);
+      struct uchange *u = uc_new(UC_DELETE, E.cy, at, row->chars + at,
+                                 (size_t)nbytes);
       u->back = 1;
       u->cx0 = pre_cx;
       u->cy0 = pre_cy;
@@ -816,8 +930,8 @@ void editor_delete_char(void) {
       undo_push(u);
       clear_redo();
     }
-    editor_row_delete_char(row, at);
-    E.cx--;
+    editor_row_delete_n(row, at, nbytes);
+    E.cx = at;
   } else {
     erow *prev = &E.row[E.cy - 1];
     struct uchange *u =
@@ -841,9 +955,10 @@ void editor_del_char(void) {
   int pre_cx = E.cx, pre_cy = E.cy;
   erow *row = &E.row[E.cy];
   if (E.cx < row->size) {
+    int nbytes = utf8_char_bytes(row->chars, row->size, E.cx);
     struct uchange *top = U.undo_n ? U.undo[U.undo_n - 1] : NULL;
-    if (!U.locked && top && top->kind == UC_DELETE && top->row == E.cy &&
-        top->at == E.cx && !top->back) {
+    if (nbytes == 1 && !U.locked && top && top->kind == UC_DELETE &&
+        top->row == E.cy && top->at == E.cx && !top->back) {
       size_t at = E.cx;
       size_t l = top->len;
       top->text = xrealloc(top->text, l + 2);
@@ -853,7 +968,8 @@ void editor_del_char(void) {
       top->cx1 = E.cx;
       top->cy1 = E.cy;
     } else {
-      struct uchange *u = uc_new(UC_DELETE, E.cy, E.cx, row->chars + E.cx, 1);
+      struct uchange *u = uc_new(UC_DELETE, E.cy, E.cx, row->chars + E.cx,
+                                 (size_t)nbytes);
       u->back = 0;
       u->cx0 = pre_cx;
       u->cy0 = pre_cy;
@@ -862,7 +978,7 @@ void editor_del_char(void) {
       undo_push(u);
       clear_redo();
     }
-    editor_row_delete_char(row, E.cx);
+    editor_row_delete_n(row, E.cx, nbytes);
   } else if (E.cy < E.numrows - 1) {
     struct uchange *u =
         uc_new(UC_JOIN, E.cy, row->size, E.row[E.cy + 1].chars,
@@ -885,7 +1001,7 @@ void editor_move_cursor(int key) {
   switch (key) {
     case ARROW_LEFT:
       if (E.cx != 0) {
-        E.cx--;
+        E.cx = utf8_prev(row->chars, E.cx);
       } else if (E.cy > 0) {
         E.cy--;
         E.cx = E.row[E.cy].size;
@@ -893,7 +1009,7 @@ void editor_move_cursor(int key) {
       break;
     case ARROW_RIGHT:
       if (row && E.cx < row->size) {
-        E.cx++;
+        E.cx += utf8_char_bytes(row->chars, row->size, E.cx);
       } else if (row && E.cx == row->size) {
         E.cy++;
         E.cx = 0;
@@ -910,6 +1026,11 @@ void editor_move_cursor(int key) {
   row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
   if (row) {
     if (E.cx > row->size) E.cx = row->size;
+    /* A vertical move can land the byte offset inside a character on the new
+     * line; step back to the character boundary. */
+    while (E.cx > 0 && E.cx < row->size &&
+           utf8_is_cont((unsigned char)row->chars[E.cx]))
+      E.cx = utf8_prev(row->chars, E.cx);
   } else {
     E.cx = 0;
   }
@@ -981,8 +1102,11 @@ void editor_draw_status_bar(struct abuf *ab) {
   int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
       E.filename ? E.filename : "[No Name]", E.numrows,
       E.dirty ? "(modified)" : "");
+  int col = (E.cy < E.numrows)
+      ? utf8_strlen(E.row[E.cy].chars, E.cx) + 1
+      : E.cx + 1;
   int rlen = snprintf(rstatus, sizeof(rstatus), "Ln %d, Col %d",
-      E.cy + 1, E.cx + 1);
+      E.cy + 1, col);
   if (len > E.screencols) len = E.screencols;
   ab_append(ab, status, len);
   /* Right-align the cursor position when it fits; otherwise pad to the edge. */
@@ -1009,7 +1133,12 @@ void editor_draw_message_bar(struct abuf *ab) {
 
 void editor_refresh_screen(void) {
   int wsrows, wscols;
-  get_window_size(&wsrows, &wscols);
+  /* On a failed size query, keep drawing at the last known size rather than
+   * with whatever half-set values the query left behind. */
+  if (get_window_size(&wsrows, &wscols) == -1) {
+    wsrows = last_wsrows;
+    wscols = last_wscols;
+  }
   if (wsrows != last_wsrows || wscols != last_wscols) {
     last_wsrows = wsrows;
     last_wscols = wscols;
@@ -1039,7 +1168,7 @@ void editor_refresh_screen(void) {
   ab_append(&ab, buf, strlen(buf));
 
   ab_append(&ab, "\x1b[?25h", 6);
-  write(STDOUT_FILENO, ab.b, ab.len);
+  write_all(STDOUT_FILENO, ab.b, (size_t)ab.len);
   free(ab.b);
 }
 
@@ -1064,7 +1193,10 @@ char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
     int c = editor_read_key();
 
     if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
-      if (buflen != 0) buf[--buflen] = '\0';
+      if (buflen != 0) {
+        buflen = (size_t)utf8_prev(buf, (int)buflen);
+        buf[buflen] = '\0';
+      }
     } else if (c == '\x1b') {
       editor_set_status_message("");
       if (callback) callback(buf, c);
@@ -1073,7 +1205,9 @@ char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
     } else if (c == '\r') {
       if (callback) callback(buf, c);
       return buf;
-    } else if (c < 128 && !iscntrl(c)) {
+    } else if (c >= 32 && c != 127 && c < 256) {
+      /* Any byte that is not a control code or one of the >=1000 key codes,
+       * so a pasted or typed UTF-8 character enters the prompt intact. */
       if (buflen == bufsize - 1) {
         bufsize *= 2;
         buf = xrealloc(buf, bufsize);
@@ -1191,34 +1325,37 @@ void editor_find_prev(void) {
     editor_set_status_message("Not found. Press Ctrl-N to search forward");
 }
 
-/* Write every row, newline-terminated, to an already-open descriptor. Rows
- * are gathered into a 64 KB buffer and written a chunk at a time: writing
- * each row and then its newline cost two syscalls per line, 100,000 of them
- * for a 50,000-line file. */
+/* Write every row to an already-open descriptor, ending each with the line
+ * ending the file was loaded with (LF, or CRLF), and omitting the final one
+ * if the file had no trailing newline. Rows are gathered into a 64 KB buffer
+ * and written a chunk at a time: writing each row and then its newline cost
+ * two syscalls per line, 100,000 of them for a 50,000-line file. */
 static int editor_write_rows(int fd, size_t *total) {
   static char buf[65536];
+  const char *eol = E.eol_crlf ? "\r\n" : "\n";
+  size_t eollen = E.eol_crlf ? 2 : 1;
   size_t used = 0, n = 0;
   int j;
   for (j = 0; j < E.numrows; j++) {
     size_t len = (size_t)E.row[j].size;
-    if (used + len + 1 > sizeof(buf)) {
+    size_t elen = (j == E.numrows - 1 && !E.final_newline) ? 0 : eollen;
+    if (used + len + elen > sizeof(buf)) {
       if (write_all(fd, buf, used) == -1) return -1;
       used = 0;
     }
-    if (len + 1 > sizeof(buf)) {
+    if (len + elen > sizeof(buf)) {
       /* Longer than the whole buffer: it was flushed above, so write the
        * row straight through. */
-      if (write_all(fd, E.row[j].chars, len) == -1 ||
-          write_all(fd, "\n", 1) == -1)
-        return -1;
+      if (write_all(fd, E.row[j].chars, len) == -1) return -1;
+      if (elen && write_all(fd, eol, elen) == -1) return -1;
     } else {
       memcpy(buf + used, E.row[j].chars, len);
-      buf[used + len] = '\n';
-      used += len + 1;
+      if (elen) memcpy(buf + used + len, eol, elen);
+      used += len + elen;
     }
-    n += len + 1;
+    n += len + elen;
   }
-  if (write_all(fd, buf, used) == -1) return -1;
+  if (used > 0 && write_all(fd, buf, used) == -1) return -1;
   *total = n;
   return 0;
 }
@@ -1265,6 +1402,7 @@ void editor_save(void) {
       return;
     }
     E.filename = name;
+    build_recovery_path();
   }
 
   /* If the name is a symlink, write past it to the real target so atomic
@@ -1281,8 +1419,10 @@ void editor_save(void) {
     target = resolved;
   }
 
-  mode_t mode = (stat(target, &st) == 0) ? (st.st_mode & 07777)
-                                         : default_file_mode();
+  int target_exists = (stat(target, &st) == 0);
+  mode_t mode = target_exists ? (st.st_mode & 07777) : default_file_mode();
+  uid_t owner_uid = target_exists ? st.st_uid : (uid_t)-1;
+  gid_t owner_gid = target_exists ? st.st_gid : (gid_t)-1;
 
   /* Write to a unique temp file next to the target, then rename over it, so
    * an interrupted save never leaves the real file truncated or empty.
@@ -1328,6 +1468,7 @@ void editor_save(void) {
         total);
     E.dirty = 0;
     saved_snapshot_take();
+    if (recovery_path[0] != '\0') unlink(recovery_path);
     return;
   }
 
@@ -1335,6 +1476,9 @@ void editor_save(void) {
   /* Not fatal if it fails: the file is saved either way, only its mode is off.
    * mkstemp creates at 0600, so the content is never briefly world-readable. */
   (void)fchmod(fd, mode);
+  /* Keep the file's owner across the replace when we have the privilege to;
+   * an unprivileged process simply cannot, and the save still succeeds. */
+  if (target_exists) (void)fchown(fd, owner_uid, owner_gid);
 
   if (editor_write_rows(fd, &total) == -1) {
     ok = 0;
@@ -1366,11 +1510,13 @@ void editor_save(void) {
   editor_set_status_message("%zu bytes written", total);
   E.dirty = 0;
   saved_snapshot_take();
+  if (recovery_path[0] != '\0') unlink(recovery_path);
 }
 
 void editor_open(char *filename) {
   free(E.filename);
   E.filename = xstrdup(filename);
+  build_recovery_path();
 
   FILE *fp = fopen(filename, "r");
   if (!fp) {
@@ -1381,11 +1527,22 @@ void editor_open(char *filename) {
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
+  int any = 0, saw_cr = 0, had_final_nl = 1;
   while ((linelen = getline(&line, &linecap, fp)) != -1) {
+    any = 1;
+    /* Whether this line -- so, once the loop ends, the last line -- carried a
+     * trailing newline, and whether the endings were CRLF. Both are preserved
+     * on save instead of being silently rewritten. */
+    had_final_nl = (linelen > 0 && line[linelen - 1] == '\n');
+    int had_cr = 0;
     while (linelen > 0 && (line[linelen - 1] == '\n' ||
-        line[linelen - 1] == '\r'))
+        line[linelen - 1] == '\r')) {
+      if (line[linelen - 1] == '\r') had_cr = 1;
       linelen--;
-    editor_insert_row(E.numrows, line, linelen);
+    }
+    if (had_cr) saw_cr = 1;
+    if (linelen > INT_MAX - 1) die("line too long");
+    editor_insert_row(E.numrows, line, (size_t)linelen);
   }
   /* getline returns -1 for a read error as well as at end of file. Taking an
    * error for the end would present a partial buffer as the whole file, and
@@ -1393,6 +1550,10 @@ void editor_open(char *filename) {
    * directory, which used to open as an empty buffer that could never be
    * saved. */
   if (!feof(fp)) die(filename);
+  if (any) {
+    E.eol_crlf = saw_cr;
+    E.final_newline = had_final_nl;
+  }
   free(line);
   fclose(fp);
   E.dirty = 0;
@@ -1438,7 +1599,7 @@ void editor_help(void) {
     ab_append(&ab, "\x1b[K", 3);
   }
 
-  write(STDOUT_FILENO, ab.b, ab.len);
+  write_all(STDOUT_FILENO, ab.b, (size_t)ab.len);
   free(ab.b);
 
   editor_read_key();
@@ -1462,8 +1623,9 @@ void editor_process_keypress(void) {
         quit_times--;
         return;
       }
-      write(STDOUT_FILENO, "\x1b[2J", 4);
-      write(STDOUT_FILENO, "\x1b[H", 3);
+      write_all(STDOUT_FILENO, "\x1b[2J", 4);
+      write_all(STDOUT_FILENO, "\x1b[H", 3);
+      if (recovery_path[0] != '\0') unlink(recovery_path);
       exit(0);
       break;
 
@@ -1547,6 +1709,12 @@ void editor_process_keypress(void) {
 }
 
 void editor_cleanup(void) {
+  int i;
+  for (i = 0; i < E.numrows; i++) editor_free_row(&E.row[i]);
+  free(E.row);
+  E.row = NULL;
+  E.numrows = 0;
+  E.rowcap = 0;
   saved_snapshot_free();
   cache_invalidate();
   free(cache_lines);
@@ -1573,11 +1741,15 @@ void init_editor(void) {
   E.rowoff = 0;
   E.coloff = 0;
   E.numrows = 0;
+  E.rowcap = 0;
   E.row = NULL;
   E.filename = NULL;
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
   E.dirty = 0;
+  E.eol_crlf = 0;
+  E.final_newline = 1;
+  build_recovery_path();
 
   if (get_window_size(&E.screenrows, &E.screencols) == -1)
     die("get_window_size");

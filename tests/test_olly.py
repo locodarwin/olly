@@ -48,6 +48,17 @@ def edit(tmpdir, original, keys, name="f.txt"):
         return fh.read()
 
 
+def edit_bytes(tmpdir, original, keys, name="f.txt"):
+    """Like edit(), but writes and reads raw bytes -- for content that is not
+    valid text (CRLF endings, no trailing newline, multibyte characters)."""
+    path = os.path.join(tmpdir, name)
+    with open(path, "wb") as fh:
+        fh.write(original)
+    run([OLLY, path], keys)
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 # --------------------------------------------------------------- input ----
 
 def test_keys(tmpdir):
@@ -292,6 +303,105 @@ def test_signals(tmpdir):
               os.WIFSIGNALED(st) and os.WTERMSIG(st) == sig, True)
 
 
+# ---------------------------------------------------------------- utf-8 ----
+
+def test_utf8(tmpdir):
+    print("\nutf-8: editing steps over whole characters")
+    cafe = "café\n".encode("utf-8")  # é is two bytes
+    # Regression: backspace/delete used to remove a single byte, leaving an
+    # invalid UTF-8 sequence behind (café -> "caf\xc3").
+    check("backspace removes a whole multibyte char",
+          edit_bytes(tmpdir, cafe, [END, "\x7f", SAVE]), b"caf\n")
+    check("forward delete removes a whole multibyte char",
+          edit_bytes(tmpdir, cafe, [HOME, RIGHT, RIGHT, RIGHT, "\x1b[3~", SAVE]),
+          b"caf\n")
+    check("right arrow crosses a multibyte char in one step",
+          edit_bytes(tmpdir, "aéb\n".encode(), [HOME, RIGHT, RIGHT, "X", SAVE]),
+          "aéXb\n".encode())
+    check("undo restores a deleted multibyte char",
+          edit_bytes(tmpdir, cafe, [END, "\x7f", "\x1a", SAVE]), cafe)
+
+    path = os.path.join(tmpdir, "col.txt")
+    with open(path, "wb") as fh:
+        fh.write(cafe)
+    # café is four characters but five bytes; the status bar's Col must report
+    # the character position (5 at end of line), never the byte position (6).
+    out = run([OLLY, path], [END])
+    check("column counts characters, not bytes",
+          b"Col 5" in out and b"Col 6" not in out, True)
+    found = (status_lines(run([OLLY, path], [HOME, "\x06", "é", "\r"]))
+             or [""])[-1]
+    check("a multibyte search term is accepted and found",
+          found.startswith("Found"), True)
+
+
+# ---------------------------------------------------------- file format ----
+
+def test_line_endings(tmpdir):
+    print("\nfile format: line endings and final newline are preserved")
+    # Regression: CRLF was rewritten to LF, and a missing final newline was
+    # added, so a Windows-origin file showed as entirely modified in git.
+    check("a CRLF file stays CRLF",
+          edit_bytes(tmpdir, b"one\r\ntwo\r\n", [SAVE]), b"one\r\ntwo\r\n")
+    check("editing a CRLF file keeps CRLF",
+          edit_bytes(tmpdir, b"one\r\ntwo\r\n", ["X", SAVE]),
+          b"Xone\r\ntwo\r\n")
+    check("a missing final newline stays missing",
+          edit_bytes(tmpdir, b"no newline", [SAVE]), b"no newline")
+    check("an LF file stays LF", edit_bytes(tmpdir, b"a\nb\n", [SAVE]),
+          b"a\nb\n")
+
+    work = tempfile.mkdtemp(dir=tmpdir)
+    cwd = os.getcwd()
+    os.chdir(work)
+    try:
+        run([OLLY, "new.txt"], ["hi", SAVE])
+        with open(os.path.join(work, "new.txt"), "rb") as fh:
+            check("a brand-new file is saved with LF and a trailing newline",
+                  fh.read(), b"hi\n")
+    finally:
+        os.chdir(cwd)
+
+
+# ------------------------------------------------------------ recovery ----
+
+def test_recovery(tmpdir):
+    print("\nrecovery: a signal with unsaved changes writes a recovery file")
+    path = os.path.join(tmpdir, "doc.txt")
+    with open(path, "w") as fh:
+        fh.write("original\n")
+    rec = path + ".olly-recover"
+
+    # Regression/feature: work used to vanish when a signal killed the editor.
+    run_until_signal([OLLY, path], signal.SIGTERM, keys=["HELLO"])
+    check("recovery file is created", os.path.exists(rec), True)
+    if os.path.exists(rec):
+        with open(rec) as fh:
+            check("recovery file holds the unsaved buffer",
+                  fh.read(), "HELLOoriginal\n")
+        os.remove(rec)
+
+    with open(rec, "w") as fh:
+        fh.write("stale\n")
+    run([OLLY, path], ["X", SAVE])
+    check("a successful save clears the recovery file",
+          os.path.exists(rec), False)
+
+    run_until_signal([OLLY, path], signal.SIGTERM)
+    check("no recovery file when nothing is unsaved",
+          os.path.exists(rec), False)
+
+
+# --------------------------------------------------------- robustness ----
+
+def test_directory_refused(tmpdir):
+    print("\nrobustness: a directory is refused, not opened as a buffer")
+    d = tempfile.mkdtemp(dir=tmpdir)
+    _, st = run([OLLY, d], [SAVE, "\x11\x11\x11\x11"], status=True)
+    check("opening a directory exits with an error",
+          os.WIFEXITED(st) and os.WEXITSTATUS(st) == 1, True)
+
+
 # ---------------------------------------------------------------- undo ----
 
 def test_undo(tmpdir):
@@ -321,10 +431,14 @@ def main():
     try:
         test_keys(tmpdir)
         test_tab(tmpdir)
+        test_utf8(tmpdir)
         test_search(tmpdir)
         test_save(tmpdir)
+        test_line_endings(tmpdir)
         test_symlink_race(tmpdir)
         test_signals(tmpdir)
+        test_recovery(tmpdir)
+        test_directory_refused(tmpdir)
         test_undo(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
