@@ -14,10 +14,12 @@ import termios
 import time
 
 
-def run(argv, keys, rows=24, cols=80, settle=0.4, env=None):
+def run(argv, keys, rows=24, cols=80, settle=0.4, env=None, status=False):
     """Start argv under a pty, send `keys`, return everything it printed.
 
     A float in `keys` is treated as a pause in seconds rather than input.
+    With status=True, return (output, wait status) instead. A program still
+    running at the end is killed, so its status reports SIGKILL.
     """
     pid, fd = pty.fork()
     if pid == 0:
@@ -45,7 +47,10 @@ def run(argv, keys, rows=24, cols=80, settle=0.4, env=None):
         if isinstance(key, float):
             time.sleep(key)
             continue
-        os.write(fd, key if isinstance(key, bytes) else key.encode())
+        try:
+            os.write(fd, key if isinstance(key, bytes) else key.encode())
+        except OSError:
+            break  # the program has already exited
         time.sleep(0.06)
         drain(0.02)
 
@@ -57,12 +62,67 @@ def run(argv, keys, rows=24, cols=80, settle=0.4, env=None):
         os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
-    os.waitpid(pid, 0)
+    _, wstatus = os.waitpid(pid, 0)
     try:
         os.close(fd)
     except OSError:
         pass
-    return out
+    return (out, wstatus) if status else out
+
+
+def run_until_signal(argv, sig, rows=24, cols=80, startup=0.5):
+    """Start argv on a pty, let it paint, then send it `sig`.
+
+    Returns (modes before start, modes while running, modes after exit, wait
+    status), each set of modes as termios.tcgetattr reports them. The slave
+    end stays open here so the terminal can still be inspected once the
+    program has gone -- its modes then are what the user is left with.
+    """
+    master, slave = os.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    before = termios.tcgetattr(slave)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(master)
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            for fd in (0, 1, 2):
+                os.dup2(slave, fd)
+            if slave > 2:
+                os.close(slave)
+            os.execve(argv[0], argv, dict(os.environ, TERM="xterm"))
+        finally:
+            os._exit(127)
+
+    def drain(timeout):
+        while select.select([master], [], [], timeout)[0]:
+            try:
+                if not os.read(master, 1 << 20):
+                    return
+            except OSError:
+                return
+
+    deadline = time.time() + startup
+    while time.time() < deadline:
+        drain(0.05)
+    during = termios.tcgetattr(slave)
+    os.kill(pid, sig)
+
+    deadline = time.time() + 3
+    while True:
+        drain(0.05)
+        done, wstatus = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if time.time() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            _, wstatus = os.waitpid(pid, 0)
+            break
+    after = termios.tcgetattr(slave)
+    os.close(master)
+    os.close(slave)
+    return before, during, after, wstatus
 
 
 def status_lines(out, rows=24):

@@ -31,7 +31,10 @@ uninstall:
 test: olly
 	python3 tests/test_olly.py ./olly
 
+test-oom: olly
+	python3 tests/oom_sweep.py ./olly
+
 clean:
 	rm -f olly editor
 
-.PHONY: clean install uninstall test
+.PHONY: clean install uninstall test test-oom

@@ -10,12 +10,13 @@ so a failure means a real regression rather than a style drift.
 import multiprocessing
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import run, status_lines
+from pty_harness import run, run_until_signal, status_lines
 
 OLLY = None
 SAVE = "\x13"
@@ -93,6 +94,19 @@ def test_keys(tmpdir):
                        ("bare ESC", "\x1b")]:
         check(label + " inserts nothing",
               edit(tmpdir, "ab\n", [seq, SAVE]), "ab\n")
+
+
+def test_tab(tmpdir):
+    print("\ninput: the Tab key types a tab")
+    # Regression: Tab is a control character, and the keypress handler threw
+    # away every control character it had no binding for, so a tab could not
+    # be typed at all -- even though tabs already in a file displayed fine.
+    check("tab at line start", edit(tmpdir, "ab\n", ["\t", SAVE]), "\tab\n")
+    check("typing continues after the tab",
+          edit(tmpdir, "ab\n", [RIGHT, "\t", "X", SAVE]), "a\tXb\n")
+    check("tab undoes", edit(tmpdir, "ab\n", ["\t", "\x1a", SAVE]), "ab\n")
+    check("unbound control characters are still not typed",
+          edit(tmpdir, "ab\n", ["\x01\x02\x0b", SAVE]), "ab\n")
 
 
 # -------------------------------------------------------------- search ----
@@ -188,6 +202,20 @@ def test_save(tmpdir):
     finally:
         os.chmod(rod, 0o755)
 
+    print("\nsave: large files round-trip through the write buffer")
+    # Save batches rows into a 64 KB buffer. Rows that exactly fill it, spill
+    # one byte past it, and dwarf it take three different paths. Kept to a few
+    # thousand rows: loading grows the row array one row at a time, which is
+    # quadratic under allocators that always move on realloc (ASan's among
+    # them), and the suite should stay usable with a sanitizer build.
+    rows = ["line %d %s" % (i, "x" * (i % 97)) for i in range(3000)]
+    rows[1000] = "a" * 65535
+    rows[1001] = "b" * 65536
+    rows[1002] = "c" * 200000
+    body = "\n".join(rows) + "\n"
+    check("rows at and past the buffer size save intact",
+          edit(tmpdir, body, ["X", SAVE], name="big.txt") == "X" + body, True)
+
     print("\nsave: content round-trips")
     check("NUL bytes survive",
           edit(tmpdir, "ab\x00cd\n", [SAVE]), "ab\x00cd\n")
@@ -244,6 +272,26 @@ def test_symlink_race(tmpdir):
           os.path.islink(doc), False)
 
 
+# ------------------------------------------------------------- signals ----
+
+def test_signals(tmpdir):
+    print("\nsignals: a killed editor hands back a usable terminal")
+    # Regression: a fatal signal skips atexit, so closing the terminal window
+    # or a plain `kill` left the terminal in raw mode -- no echo, no line
+    # editing -- until the user blindly typed `reset`.
+    path = os.path.join(tmpdir, "sig.txt")
+    with open(path, "w") as fh:
+        fh.write("data\n")
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        sig = getattr(signal, name)
+        before, during, after, st = run_until_signal([OLLY, path], sig)
+        check(name + ": the editor had switched the terminal to raw mode",
+              during != before, True)
+        check(name + ": terminal modes restored", after, before)
+        check(name + ": still exits by the signal",
+              os.WIFSIGNALED(st) and os.WTERMSIG(st) == sig, True)
+
+
 # ---------------------------------------------------------------- undo ----
 
 def test_undo(tmpdir):
@@ -272,9 +320,11 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="olly-tests-")
     try:
         test_keys(tmpdir)
+        test_tab(tmpdir)
         test_search(tmpdir)
         test_save(tmpdir)
         test_symlink_race(tmpdir)
+        test_signals(tmpdir)
         test_undo(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
