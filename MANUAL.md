@@ -52,6 +52,9 @@ To remove the installed binary:
                               # empty; saved only when you save it)
 
 If the file does not exist, Olly opens an empty buffer rather than failing.
+A path that exists but cannot be read in full — a directory, for example — is
+refused with an error instead of being opened as an empty or partial buffer
+that a later save would write back over the original.
 The status bar (the highlighted line at the bottom) shows the file name, the
 number of lines, whether the buffer is modified, and the cursor position as
 `Ln <line>, Col <column>`.
@@ -63,6 +66,7 @@ Olly is modeless: whatever you type is inserted at the cursor.
 | Key | Action |
 | --- | --- |
 | Any character | Insert at the cursor |
+| `Tab` | Insert a tab character |
 | `Enter` | Split the line / insert a new line |
 | `Backspace` | Delete the character before the cursor |
 | `Delete` | Delete the character at the cursor |
@@ -159,6 +163,11 @@ Olly protects you from losing work: when there are unsaved changes, the first
 few presses of `Ctrl-Q` only confirm that you really want to quit, and a
 warning shows how many more presses are needed. A clean buffer quits on the
 first `Ctrl-Q`.
+
+If Olly is stopped from outside instead — its terminal window is closed, or it
+receives `SIGTERM`, `SIGHUP`, `SIGINT` or `SIGQUIT` — it puts your terminal's
+settings back on the way out, so the shell you return to echoes and edits
+normally. Unsaved changes are lost in that case: Olly keeps no recovery file.
 
 After saving, the undo history is kept, but the dirty flag is cleared.
 

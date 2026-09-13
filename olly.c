@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,19 +88,38 @@ static struct undoState U;
 struct abuf {
   char *b;
   int len;
+  int cap;
 };
 
-#define ABUF_INIT {NULL, 0}
+#define ABUF_INIT {NULL, 0, 0}
 
 void die(const char *s);
 void editor_set_status_message(const char *fmt, ...);
 
-void ab_append(struct abuf *ab, const char *s, int len) {
-  char *new = realloc(ab->b, ab->len + len);
+/* Make room for `extra` more bytes. Capacity doubles, so a frame costs a few
+ * reallocs in total; growing by exactly the appended length cost one realloc
+ * per append, and the status bar appended its padding a byte at a time. */
+static void ab_reserve(struct abuf *ab, int extra) {
+  if (ab->b != NULL && ab->len + extra <= ab->cap) return;
+  int cap = ab->cap ? ab->cap : 4096;
+  while (cap < ab->len + extra) cap *= 2;
+  char *new = realloc(ab->b, (size_t)cap);
   if (new == NULL) die("ab_append");
-  memcpy(&new[ab->len], s, len);
   ab->b = new;
+  ab->cap = cap;
+}
+
+void ab_append(struct abuf *ab, const char *s, int len) {
+  ab_reserve(ab, len);
+  memcpy(&ab->b[ab->len], s, len);
   ab->len += len;
+}
+
+static void ab_append_fill(struct abuf *ab, char c, int n) {
+  if (n <= 0) return;
+  ab_reserve(ab, n);
+  memset(&ab->b[ab->len], c, (size_t)n);
+  ab->len += n;
 }
 
 void die(const char *s) {
@@ -107,6 +127,27 @@ void die(const char *s) {
   write(STDOUT_FILENO, "\x1b[H", 3);
   perror(s);
   exit(1);
+}
+
+/* Out of memory is fatal. Routing every allocation through these means it
+ * exits through die(), restoring the terminal, rather than dereferencing
+ * NULL a moment later. */
+static void *xmalloc(size_t n) {
+  void *p = malloc(n);
+  if (p == NULL) die("malloc");
+  return p;
+}
+
+static void *xrealloc(void *p, size_t n) {
+  void *np = realloc(p, n);
+  if (np == NULL) die("realloc");
+  return np;
+}
+
+static char *xstrdup(const char *s) {
+  char *p = strdup(s);
+  if (p == NULL) die("strdup");
+  return p;
 }
 
 /* --- saved-content snapshot: the buffer is only "modified" when it really
@@ -253,14 +294,42 @@ int write_all(int fd, const void *p0, size_t n) {
   return 0;
 }
 
+/* Runs from atexit, where die() -- which calls exit() again -- would be
+ * undefined behaviour. If the terminal is already gone there is nothing left
+ * to restore anyway. */
 void disable_raw_mode(void) {
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
-    die("tcsetattr");
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
+}
+
+/* A fatal signal bypasses atexit, so closing the terminal window or a plain
+ * `kill` used to leave the terminal in raw mode, with no echo and no line
+ * editing. Restore it, then re-raise so the process still dies by the signal.
+ * Only async-signal-safe calls belong here. */
+static void handle_fatal_signal(int sig) {
+  static const char reset[] = "\x1b[?25h\x1b[2J\x1b[H";
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
+  write(STDOUT_FILENO, reset, sizeof(reset) - 1);
+  raise(sig);
+}
+
+static void install_signal_handlers(void) {
+  static const int sigs[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+  struct sigaction sa;
+  size_t i;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = handle_fatal_signal;
+  sigemptyset(&sa.sa_mask);
+  /* The handler is reset to the default on entry, so the raise() in it ends
+   * the process with the signal's normal action. */
+  sa.sa_flags = SA_RESETHAND;
+  for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+    sigaction(sigs[i], &sa, NULL);
 }
 
 void enable_raw_mode(void) {
   if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
   atexit(disable_raw_mode);
+  install_signal_handlers();
 
   struct termios raw = E.orig_termios;
   raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -386,9 +455,8 @@ void editor_update_row(erow *row) {
   {
     int need = row->size + tabs * (KILO_TAB_STOP - 1) + 1;
     if (row->rcap < need) {
+      row->render = xrealloc(row->render, (size_t)need);
       row->rcap = need;
-      row->render = realloc(row->render, (size_t)need);
-      if (row->render == NULL) die("editor_update_row");
     }
   }
 
@@ -407,11 +475,11 @@ void editor_update_row(erow *row) {
 
 void editor_insert_row(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
-  E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+  E.row = xrealloc(E.row, sizeof(erow) * (size_t)(E.numrows + 1));
   memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
 
   E.row[at].size = len;
-  E.row[at].chars = malloc(len + 1);
+  E.row[at].chars = xmalloc(len + 1);
   memcpy(E.row[at].chars, s, len);
   E.row[at].chars[len] = '\0';
   E.row[at].rsize = 0;
@@ -438,7 +506,7 @@ void editor_delete_row(int at) {
 
 void editor_row_insert_char(erow *row, int at, int c) {
   if (at < 0 || at > row->size) at = row->size;
-  row->chars = realloc(row->chars, row->size + 2);
+  row->chars = xrealloc(row->chars, (size_t)row->size + 2);
   memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
   row->size++;
   row->chars[at] = c;
@@ -447,7 +515,7 @@ void editor_row_insert_char(erow *row, int at, int c) {
 }
 
 void editor_row_append_string(erow *row, char *s, size_t len) {
-  row->chars = realloc(row->chars, row->size + len + 1);
+  row->chars = xrealloc(row->chars, (size_t)row->size + len + 1);
   memcpy(&row->chars[row->size], s, len);
   row->size += len;
   row->chars[row->size] = '\0';
@@ -464,7 +532,7 @@ void editor_row_delete_char(erow *row, int at) {
 
 void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
   if (at < 0 || at > row->size) at = row->size;
-  row->chars = realloc(row->chars, row->size + n + 1);
+  row->chars = xrealloc(row->chars, (size_t)row->size + n + 1);
   memmove(&row->chars[at + n], &row->chars[at], row->size - at + 1);
   memcpy(&row->chars[at], s, n);
   row->size += n;
@@ -482,13 +550,13 @@ void editor_row_delete_n(erow *row, int at, int n) {
 }
 
 struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) {
-  struct uchange *u = malloc(sizeof(struct uchange));
+  struct uchange *u = xmalloc(sizeof(struct uchange));
   u->kind = kind;
   u->row = row;
   u->at = at;
   u->back = 0;
   u->len = len;
-  u->text = malloc(len + 1);
+  u->text = xmalloc(len + 1);
   if (len) memcpy(u->text, text, len);
   u->text[len] = '\0';
   u->cx0 = 0;
@@ -501,7 +569,7 @@ struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) 
 void undo_push(struct uchange *u) {
   if (U.undo_n == U.undo_cap) {
     U.undo_cap = U.undo_cap ? U.undo_cap * 2 : 32;
-    U.undo = realloc(U.undo, sizeof(struct uchange *) * U.undo_cap);
+    U.undo = xrealloc(U.undo, sizeof(struct uchange *) * (size_t)U.undo_cap);
   }
   U.undo[U.undo_n++] = u;
 }
@@ -509,7 +577,7 @@ void undo_push(struct uchange *u) {
 void redo_push(struct uchange *u) {
   if (U.redo_n == U.redo_cap) {
     U.redo_cap = U.redo_cap ? U.redo_cap * 2 : 32;
-    U.redo = realloc(U.redo, sizeof(struct uchange *) * U.redo_cap);
+    U.redo = xrealloc(U.redo, sizeof(struct uchange *) * (size_t)U.redo_cap);
   }
   U.redo[U.redo_n++] = u;
 }
@@ -669,7 +737,7 @@ void editor_insert_char(int c) {
   struct uchange *top = U.undo_n ? U.undo[U.undo_n - 1] : NULL;
   if (!U.locked && top && top->kind == UC_INSERT && top->row == E.cy &&
       top->at + (int)top->len == E.cx - 1) {
-    top->text = realloc(top->text, top->len + 2);
+    top->text = xrealloc(top->text, top->len + 2);
     top->text[top->len++] = c;
     top->text[top->len] = '\0';
     top->cx1 = E.cx;
@@ -728,7 +796,7 @@ void editor_delete_char(void) {
     struct uchange *top = U.undo_n ? U.undo[U.undo_n - 1] : NULL;
     if (!U.locked && top && top->kind == UC_DELETE && top->row == E.cy &&
         top->at == E.cx && top->back) {
-      char *nt = malloc(top->len + 2);
+      char *nt = xmalloc(top->len + 2);
       nt[0] = row->chars[at];
       memcpy(nt + 1, top->text, top->len);
       nt[top->len + 1] = '\0';
@@ -778,7 +846,7 @@ void editor_del_char(void) {
         top->at == E.cx && !top->back) {
       size_t at = E.cx;
       size_t l = top->len;
-      top->text = realloc(top->text, l + 2);
+      top->text = xrealloc(top->text, l + 2);
       top->text[l] = row->chars[at];
       top->text[l + 1] = '\0';
       top->len++;
@@ -917,14 +985,12 @@ void editor_draw_status_bar(struct abuf *ab) {
       E.cy + 1, E.cx + 1);
   if (len > E.screencols) len = E.screencols;
   ab_append(ab, status, len);
-  while (len < E.screencols) {
-    if (E.screencols - len == rlen) {
-      ab_append(ab, rstatus, rlen);
-      break;
-    } else {
-      ab_append(ab, " ", 1);
-      len++;
-    }
+  /* Right-align the cursor position when it fits; otherwise pad to the edge. */
+  if (E.screencols - len >= rlen) {
+    ab_append_fill(ab, ' ', E.screencols - len - rlen);
+    ab_append(ab, rstatus, rlen);
+  } else {
+    ab_append_fill(ab, ' ', E.screencols - len);
   }
   ab_append(ab, "\x1b[m", 3);
   ab_append(ab, "\x1b[K", 3);
@@ -987,7 +1053,7 @@ void editor_set_status_message(const char *fmt, ...) {
 
 char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
   size_t bufsize = 128;
-  char *buf = malloc(bufsize);
+  char *buf = xmalloc(bufsize);
   size_t buflen = 0;
   buf[0] = '\0';
 
@@ -1007,10 +1073,10 @@ char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
     } else if (c == '\r') {
       if (callback) callback(buf, c);
       return buf;
-    } else if (!iscntrl(c) && c < 128) {
+    } else if (c < 128 && !iscntrl(c)) {
       if (buflen == bufsize - 1) {
         bufsize *= 2;
-        buf = realloc(buf, bufsize);
+        buf = xrealloc(buf, bufsize);
       }
       buf[buflen++] = c;
       buf[buflen] = '\0';
@@ -1024,7 +1090,7 @@ static char *last_query = NULL;
 
 static void editor_set_last_query(const char *q) {
   if (last_query) free(last_query);
-  last_query = q ? strdup(q) : NULL;
+  last_query = q ? xstrdup(q) : NULL;
 }
 
 /* dir = 1 search forward, -1 search backward. exclude_current causes the
@@ -1125,16 +1191,34 @@ void editor_find_prev(void) {
     editor_set_status_message("Not found. Press Ctrl-N to search forward");
 }
 
-/* Write every row, newline-terminated, to an already-open descriptor. */
+/* Write every row, newline-terminated, to an already-open descriptor. Rows
+ * are gathered into a 64 KB buffer and written a chunk at a time: writing
+ * each row and then its newline cost two syscalls per line, 100,000 of them
+ * for a 50,000-line file. */
 static int editor_write_rows(int fd, size_t *total) {
-  size_t n = 0;
+  static char buf[65536];
+  size_t used = 0, n = 0;
   int j;
   for (j = 0; j < E.numrows; j++) {
-    if (write_all(fd, E.row[j].chars, (size_t)E.row[j].size) == -1 ||
-        write_all(fd, "\n", 1) == -1)
-      return -1;
-    n += (size_t)E.row[j].size + 1;
+    size_t len = (size_t)E.row[j].size;
+    if (used + len + 1 > sizeof(buf)) {
+      if (write_all(fd, buf, used) == -1) return -1;
+      used = 0;
+    }
+    if (len + 1 > sizeof(buf)) {
+      /* Longer than the whole buffer: it was flushed above, so write the
+       * row straight through. */
+      if (write_all(fd, E.row[j].chars, len) == -1 ||
+          write_all(fd, "\n", 1) == -1)
+        return -1;
+    } else {
+      memcpy(buf + used, E.row[j].chars, len);
+      buf[used + len] = '\n';
+      used += len + 1;
+    }
+    n += len + 1;
   }
+  if (write_all(fd, buf, used) == -1) return -1;
   *total = n;
   return 0;
 }
@@ -1286,7 +1370,7 @@ void editor_save(void) {
 
 void editor_open(char *filename) {
   free(E.filename);
-  E.filename = strdup(filename);
+  E.filename = xstrdup(filename);
 
   FILE *fp = fopen(filename, "r");
   if (!fp) {
@@ -1303,6 +1387,12 @@ void editor_open(char *filename) {
       linelen--;
     editor_insert_row(E.numrows, line, linelen);
   }
+  /* getline returns -1 for a read error as well as at end of file. Taking an
+   * error for the end would present a partial buffer as the whole file, and
+   * the next save would truncate the file on disk. This also refuses a
+   * directory, which used to open as an empty buffer that could never be
+   * saved. */
+  if (!feof(fp)) die(filename);
   free(line);
   fclose(fp);
   E.dirty = 0;
@@ -1446,7 +1536,10 @@ void editor_process_keypress(void) {
       break;
 
     default:
-      if (!iscntrl(c)) editor_insert_char(c);
+      /* Tab is a control character, so testing iscntrl() alone threw it
+       * away and a tab could not be typed at all. Key codes of 1000 and up
+       * are outside iscntrl()'s domain and must not reach it. */
+      if (c == '\t' || (c < 256 && !iscntrl(c))) editor_insert_char(c);
       break;
   }
 
