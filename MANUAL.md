@@ -167,7 +167,18 @@ first `Ctrl-Q`.
 If Olly is stopped from outside instead — its terminal window is closed, or it
 receives `SIGTERM`, `SIGHUP`, `SIGINT` or `SIGQUIT` — it puts your terminal's
 settings back on the way out, so the shell you return to echoes and edits
-normally. Unsaved changes are lost in that case: Olly keeps no recovery file.
+normally.
+
+### Recovery of unsaved work
+
+If Olly is killed by one of those signals, or exits because it ran out of
+memory, and the buffer had unsaved changes, it writes what was in the buffer
+to a recovery file before it goes. The recovery file sits next to the file you
+were editing, named after it with a `.olly-recover` suffix (for an unnamed
+buffer it is `olly-recover.<pid>` in the current directory). Nothing opens it
+for you — inspect it and rename it over your file if you want to keep it. A
+successful save removes any recovery file for that name, and so does a clean
+`Ctrl-Q` quit.
 
 After saving, the undo history is kept, but the dirty flag is cleared.
 
@@ -186,8 +197,15 @@ After saving, the undo history is kept, but the dirty flag is cleared.
 
 ## File Format Notes
 
-- Files are saved with a trailing newline on each line (the usual text file
-  convention). A one-line buffer containing `hello` is stored as `hello\n`.
-- A file that ends without a trailing newline is loaded fine; lines are
-  stripped of their line endings when read.
+- Line endings are preserved. A file loaded with Windows `CRLF` endings is
+  saved back with `CRLF`; a Unix `LF` file stays `LF`. A brand-new file uses
+  `LF`.
+- A trailing newline is preserved too: if the file you opened ended without
+  one, the save leaves it without one. A brand-new file is given a trailing
+  newline.
+- Text is stored and saved as raw bytes, so UTF-8 (and any other encoding)
+  round-trips unchanged. The cursor, `Backspace` and `Delete` operate on whole
+  UTF-8 characters rather than individual bytes, and the `Col` indicator counts
+  characters. On-screen column alignment for double-width or combining
+  characters is approximate.
 - The status bar shows the file name capped at 20 characters.

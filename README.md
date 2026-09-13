@@ -4,8 +4,8 @@ A small, dependency-free text editor for the terminal, written in C11.
 
 Olly is a modeless editor in the spirit of nano: start typing and you're
 editing. It offers incremental search that wraps around the file, grouped
-undo/redo, automatic empty-file creation, and bulletproof save-and-quit
-handling — all in a single ~1000-line C file with zero external dependencies.
+undo/redo, automatic empty-file creation, and careful, atomic save handling —
+all in a single C file with zero external dependencies.
 
 ## Features
 
@@ -16,6 +16,14 @@ handling — all in a single ~1000-line C file with zero external dependencies.
     press `Ctrl-F` again with an empty query to repeat.
 - **Grouped undo/redo** — a run of typed (or deleted) characters undoes as
   one step. `Ctrl-Z` undo, `Ctrl-Y` redo.
+- **Atomic saves** — the file is written to a private temporary file and
+  renamed into place, so an interrupted save never leaves it truncated. Line
+  endings (`LF` or `CRLF`), a missing final newline, and the file's mode and
+  owner are all preserved.
+- **UTF-8-aware editing** — the cursor, `Backspace` and `Delete` move over
+  whole characters, and text round-trips as raw bytes.
+- **Crash recovery** — if a signal or an out-of-memory condition kills Olly
+  with unsaved changes, the buffer is written to a `.olly-recover` file.
 - **Open anything** — never errors on a missing file; it simply starts an
   empty buffer.
 - **Dirty-quit protection** — when there are unsaved changes, `Ctrl-Q` asks

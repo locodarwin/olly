@@ -70,8 +70,8 @@ def run(argv, keys, rows=24, cols=80, settle=0.4, env=None, status=False):
     return (out, wstatus) if status else out
 
 
-def run_until_signal(argv, sig, rows=24, cols=80, startup=0.5):
-    """Start argv on a pty, let it paint, then send it `sig`.
+def run_until_signal(argv, sig, rows=24, cols=80, startup=0.5, keys=()):
+    """Start argv on a pty, let it paint, optionally type `keys`, then `sig`.
 
     Returns (modes before start, modes while running, modes after exit, wait
     status), each set of modes as termios.tcgetattr reports them. The slave
@@ -106,6 +106,10 @@ def run_until_signal(argv, sig, rows=24, cols=80, startup=0.5):
     deadline = time.time() + startup
     while time.time() < deadline:
         drain(0.05)
+    for key in keys:
+        os.write(master, key if isinstance(key, bytes) else key.encode())
+        time.sleep(0.06)
+        drain(0.02)
     during = termios.tcgetattr(slave)
     os.kill(pid, sig)
 

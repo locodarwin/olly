@@ -97,7 +97,9 @@ def main():
                         problems.append(result)
                     if content not in (ORIGINAL, expected):
                         problems.append("file left as %r" % content[:60])
-                    if files != ["f.txt"]:
+                    # A death with unsaved changes deliberately leaves a
+                    # recovery file beside the target; that is not a leak.
+                    if set(files) - {"f.txt", "f.txt.olly-recover"}:
                         problems.append("stray files %s" % files)
                     if problems:
                         failures.append(k)
