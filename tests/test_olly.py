@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import run, run_until_signal, status_lines
+from pty_harness import run, run_until_signal, status_lines, cursor_col
 
 OLLY = None
 SAVE = "\x13"
@@ -335,6 +335,35 @@ def test_utf8(tmpdir):
           found.startswith("Found"), True)
 
 
+# ------------------------------------------------- wide-char rendering ----
+
+def test_wide(tmpdir):
+    print("\nwide chars: the cursor column tracks display width, not bytes")
+
+    def cursor_after(body, keys):
+        path = os.path.join(tmpdir, "w.txt")
+        with open(path, "wb") as fh:
+            fh.write(body.encode("utf-8"))
+        return cursor_col(run([OLLY, path], keys))
+
+    # A wide glyph (U+3042, HIRAGANA A) occupies two columns but three bytes.
+    # End of "aあb" is at display column 4, so the cursor sits at screen col 5
+    # -- byte counting would wrongly place it at 6.
+    check("wide glyph counts as two columns",
+          cursor_after("aあb\n", [END]), 5)
+    # A combining mark (U+0301) adds no column: "e" + acute is one column wide.
+    check("combining mark counts as zero columns",
+          cursor_after("é\n", [END]), 2)
+    # Stepping onto a wide glyph lands the cursor past its full width.
+    check("cursor steps across a wide glyph by two columns",
+          cursor_after("あい\n", [HOME, RIGHT]), 3)
+    # In a narrow window full of wide glyphs the cursor never runs off the
+    # right edge (a split glyph is dropped, not half-drawn).
+    col = cursor_after("あ" * 40 + "\n", [END], )
+    check("cursor stays within a narrow window of wide glyphs",
+          col is not None and col <= 80, True)
+
+
 # ---------------------------------------------------------- file format ----
 
 def test_line_endings(tmpdir):
@@ -432,6 +461,7 @@ def main():
         test_keys(tmpdir)
         test_tab(tmpdir)
         test_utf8(tmpdir)
+        test_wide(tmpdir)
         test_search(tmpdir)
         test_save(tmpdir)
         test_line_endings(tmpdir)
