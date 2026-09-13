@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <time.h>
@@ -36,6 +37,7 @@ enum editorKey {
 typedef struct erow {
   int size;
   int rsize;
+  int rcap;
   char *chars;
   char *render;
 } erow;
@@ -89,11 +91,12 @@ struct abuf {
 
 #define ABUF_INIT {NULL, 0}
 
+void die(const char *s);
 void editor_set_status_message(const char *fmt, ...);
 
 void ab_append(struct abuf *ab, const char *s, int len) {
   char *new = realloc(ab->b, ab->len + len);
-  if (new == NULL) return;
+  if (new == NULL) die("ab_append");
   memcpy(&new[ab->len], s, len);
   ab->b = new;
   ab->len += len;
@@ -104,6 +107,150 @@ void die(const char *s) {
   write(STDOUT_FILENO, "\x1b[H", 3);
   perror(s);
   exit(1);
+}
+
+/* --- saved-content snapshot: the buffer is only "modified" when it really
+ * differs from what is on disk, so undoing back to the saved state clears
+ * the dirty flag and the quit warning. --- */
+
+static erow *saved_rows;
+static int saved_numrows;
+
+void saved_snapshot_free(void) {
+  int i;
+  for (i = 0; i < saved_numrows; i++) {
+    free(saved_rows[i].render);
+    free(saved_rows[i].chars);
+  }
+  free(saved_rows);
+  saved_rows = NULL;
+  saved_numrows = 0;
+}
+
+void saved_snapshot_take(void) {
+  int i;
+  saved_snapshot_free();
+  if (E.numrows == 0) return;
+  saved_rows = malloc(sizeof(erow) * (size_t)E.numrows);
+  if (saved_rows == NULL) return;
+  saved_numrows = E.numrows;
+  for (i = 0; i < saved_numrows; i++) {
+    saved_rows[i].size = E.row[i].size;
+    saved_rows[i].chars = malloc((size_t)E.row[i].size + 1);
+    if (saved_rows[i].chars != NULL) {
+      memcpy(saved_rows[i].chars, E.row[i].chars, (size_t)E.row[i].size);
+      saved_rows[i].chars[E.row[i].size] = '\0';
+    } else {
+      saved_rows[i].size = 0;
+    }
+    saved_rows[i].rsize = 0;
+    saved_rows[i].render = NULL;
+    saved_rows[i].rcap = 0;
+  }
+}
+
+int editor_matches_saved(void) {
+  int i;
+  if (E.numrows != saved_numrows) return 0;
+  for (i = 0; i < E.numrows; i++) {
+    if (saved_rows[i].chars == NULL) return 0;
+    if (E.row[i].size != saved_rows[i].size) return 0;
+    if (memcmp(E.row[i].chars, saved_rows[i].chars, (size_t)E.row[i].size) != 0)
+      return 0;
+  }
+  return 1;
+}
+
+void editor_recompute_dirty(void) {
+  E.dirty = editor_matches_saved() ? 0 : 1;
+}
+
+/* --- partial screen refresh: rendered rows are cached per screen line, and
+ * only lines whose content actually changed are re-emitted (positioned
+ * explicitly). Full redraws happen only on start, resize, Ctrl-L or after
+ * the help overlay. --- */
+
+static char **cache_lines;
+static int *cache_lens;
+static int *cache_caps;
+static int cache_alloc;
+static int force_full;
+static int last_wsrows;
+static int last_wscols;
+static char *welcome_buf;
+static int welcome_cap;
+
+void cache_invalidate(void) {
+  int i;
+  for (i = 0; i < cache_alloc; i++) {
+    free(cache_lines[i]);
+    cache_lines[i] = NULL;
+    cache_lens[i] = -1;
+    cache_caps[i] = 0;
+  }
+}
+
+void cache_ensure(int y) {
+  int i, na;
+  char **nl;
+  int *nlens, *ncaps;
+  if (y < cache_alloc) return;
+  na = cache_alloc ? cache_alloc * 2 : 32;
+  if (na <= y) na = y + 1;
+  nl = realloc(cache_lines, sizeof(char *) * (size_t)na);
+  nlens = realloc(cache_lens, sizeof(int) * (size_t)na);
+  ncaps = realloc(cache_caps, sizeof(int) * (size_t)na);
+  if (nl == NULL || nlens == NULL || ncaps == NULL) die("cache_ensure");
+  cache_lines = nl;
+  cache_lens = nlens;
+  cache_caps = ncaps;
+  for (i = cache_alloc; i < na; i++) {
+    cache_lines[i] = NULL;
+    cache_lens[i] = -1;
+    cache_caps[i] = 0;
+  }
+  cache_alloc = na;
+}
+
+void cache_line_draw(struct abuf *ab, int y, const char *s, int len, int force) {
+  char pos[32];
+  char *nb;
+  cache_ensure(y);
+  if (!force && cache_lens[y] == len &&
+      (len == 0 || memcmp(cache_lines[y], s, (size_t)len) == 0))
+    return;
+  {
+    int plen = snprintf(pos, sizeof(pos), "\x1b[%d;1H", y + 1);
+    ab_append(ab, pos, plen);
+  }
+  ab_append(ab, s, len);
+  ab_append(ab, "\x1b[K", 3);
+  if (cache_caps[y] < len + 1) {
+    nb = realloc(cache_lines[y], (size_t)len + 1);
+    if (nb == NULL) die("cache_line_draw");
+    cache_lines[y] = nb;
+    cache_caps[y] = len + 1;
+  }
+  if (len > 0) memcpy(cache_lines[y], s, (size_t)len);
+  cache_lines[y][len] = '\0';
+  cache_lens[y] = len;
+}
+
+/* --- robust full write: retries on EINTR and loops over partial writes --- */
+
+int write_all(int fd, const void *p0, size_t n) {
+  const char *p = p0;
+  while (n > 0) {
+    ssize_t w = write(fd, p, n);
+    if (w == -1) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (w == 0) return -1;
+    p += w;
+    n -= (size_t)w;
+  }
+  return 0;
 }
 
 void disable_raw_mode(void) {
@@ -128,7 +275,7 @@ void enable_raw_mode(void) {
 
 int editor_read_key(void) {
   int nread;
-  char c;
+  unsigned char c;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
     if (nread == -1 && errno != EAGAIN) die("read");
   }
@@ -212,8 +359,14 @@ void editor_update_row(erow *row) {
   for (j = 0; j < row->size; j++)
     if (row->chars[j] == '\t') tabs++;
 
-  free(row->render);
-  row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+  {
+    int need = row->size + tabs * (KILO_TAB_STOP - 1) + 1;
+    if (row->rcap < need) {
+      row->rcap = need;
+      row->render = realloc(row->render, (size_t)need);
+      if (row->render == NULL) die("editor_update_row");
+    }
+  }
 
   int idx = 0;
   for (j = 0; j < row->size; j++) {
@@ -239,6 +392,7 @@ void editor_insert_row(int at, char *s, size_t len) {
   E.row[at].chars[len] = '\0';
   E.row[at].rsize = 0;
   E.row[at].render = NULL;
+  E.row[at].rcap = 0;
   editor_update_row(&E.row[at]);
 
   E.numrows++;
@@ -345,6 +499,27 @@ void clear_redo(void) {
   U.redo_n = 0;
 }
 
+void editor_free_undo_redo(void) {
+  int i;
+  for (i = 0; i < U.undo_n; i++) {
+    free(U.undo[i]->text);
+    free(U.undo[i]);
+  }
+  for (i = 0; i < U.redo_n; i++) {
+    free(U.redo[i]->text);
+    free(U.redo[i]);
+  }
+  free(U.undo);
+  free(U.redo);
+  U.undo = NULL;
+  U.redo = NULL;
+  U.undo_n = 0;
+  U.undo_cap = 0;
+  U.redo_n = 0;
+  U.redo_cap = 0;
+  U.locked = 0;
+}
+
 void uc_free(struct uchange *u) {
   free(u->text);
   free(u);
@@ -403,7 +578,7 @@ void uc_apply(struct uchange *u, int redo) {
     E.cx = u->cx0;
     E.cy = u->cy0;
   }
-  E.dirty++;
+  editor_recompute_dirty();
 }
 
 void editor_undo(void) {
@@ -666,32 +841,49 @@ void editor_draw_rows(struct abuf *ab) {
     int filerow = y + E.rowoff;
     if (filerow >= E.numrows) {
       if (E.numrows == 0 && y == E.screenrows / 3) {
-        char welcome[80];
-        int welcomelen = snprintf(welcome, sizeof(welcome),
-            "Olly editor -- version %s", OLLY_VERSION);
+        char text[96];
+        int welcomelen = snprintf(text, sizeof(text),
+                                  "Olly editor -- version %s", OLLY_VERSION);
         if (welcomelen > E.screencols) welcomelen = E.screencols;
-        int padding = (E.screencols - welcomelen) / 2;
-        if (padding) {
-          ab_append(ab, "~", 1);
-          padding--;
+        int pad = (E.screencols - welcomelen) / 2;
+        if (pad > 0) {
+          int need = pad + welcomelen + 1;
+          if (welcome_cap < need) {
+            char *nb = realloc(welcome_buf, (size_t)need);
+            if (nb == NULL) {
+              cache_line_draw(ab, y, text, welcomelen, 1);
+              continue;
+            }
+            welcome_buf = nb;
+            welcome_cap = need;
+          }
+          {
+            int n = 0;
+            welcome_buf[n++] = '~';
+            while (n < pad) welcome_buf[n++] = ' ';
+            memcpy(welcome_buf + n, text, (size_t)welcomelen);
+            n += welcomelen;
+            cache_line_draw(ab, y, welcome_buf, n, 1);
+          }
+        } else {
+          cache_line_draw(ab, y, text, welcomelen, 1);
         }
-        while (padding--) ab_append(ab, " ", 1);
-        ab_append(ab, welcome, welcomelen);
       } else {
-        ab_append(ab, "~", 1);
+        cache_line_draw(ab, y, "~", 1, 0);
       }
     } else {
       int len = E.row[filerow].rsize - E.coloff;
       if (len < 0) len = 0;
       if (len > E.screencols) len = E.screencols;
-      ab_append(ab, E.row[filerow].render + E.coloff, len);
+      cache_line_draw(ab, y, E.row[filerow].render + E.coloff, len, 0);
     }
-    ab_append(ab, "\x1b[K", 3);
-    ab_append(ab, "\r\n", 2);
   }
 }
 
 void editor_draw_status_bar(struct abuf *ab) {
+  char rp[32];
+  int rplen = snprintf(rp, sizeof(rp), "\x1b[%d;1H", E.screenrows + 1);
+  ab_append(ab, rp, rplen);
   ab_append(ab, "\x1b[7m", 4);
   char status[80], rstatus[80];
   int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
@@ -711,10 +903,13 @@ void editor_draw_status_bar(struct abuf *ab) {
     }
   }
   ab_append(ab, "\x1b[m", 3);
-  ab_append(ab, "\r\n", 2);
+  ab_append(ab, "\x1b[K", 3);
 }
 
 void editor_draw_message_bar(struct abuf *ab) {
+  char rp[32];
+  int rplen = snprintf(rp, sizeof(rp), "\x1b[%d;1H", E.screenrows + 2);
+  ab_append(ab, rp, rplen);
   ab_append(ab, "\x1b[K", 3);
   int msglen = strlen(E.statusmsg);
   if (msglen > E.screencols) msglen = E.screencols;
@@ -723,14 +918,26 @@ void editor_draw_message_bar(struct abuf *ab) {
 }
 
 void editor_refresh_screen(void) {
-  get_window_size(&E.screenrows, &E.screencols);
-  E.screenrows -= 2;
+  int wsrows, wscols;
+  get_window_size(&wsrows, &wscols);
+  if (wsrows != last_wsrows || wscols != last_wscols) {
+    last_wsrows = wsrows;
+    last_wscols = wscols;
+    force_full = 1;
+  }
+  E.screenrows = wsrows - 2;
   if (E.screenrows < 1) E.screenrows = 1;
+  E.screencols = wscols;
   editor_scroll();
 
   struct abuf ab = ABUF_INIT;
   ab_append(&ab, "\x1b[?25l", 6);
-  ab_append(&ab, "\x1b[H", 3);
+  if (force_full) {
+    cache_invalidate();
+    ab_append(&ab, "\x1b[2J", 4);
+    ab_append(&ab, "\x1b[H", 3);
+    force_full = 0;
+  }
 
   editor_draw_rows(&ab);
   editor_draw_status_bar(&ab);
@@ -896,51 +1103,74 @@ void editor_save(void) {
     }
   }
 
-  int len = 0;
-  int j;
-  for (j = 0; j < E.numrows; j++)
-    len += E.row[j].size + 1;
+  /* If the name is a symlink, write past it to the real target so atomic
+   * rename replaces the file contents rather than the link itself. */
+  const char *target = E.filename;
+  char *resolved = NULL;
+  struct stat st;
+  if (lstat(E.filename, &st) == 0 && S_ISLNK(st.st_mode)) {
+    resolved = realpath(E.filename, NULL);
+    if (resolved == NULL) {
+      editor_set_status_message("Save failed: %s", strerror(errno));
+      return;
+    }
+    target = resolved;
+  }
 
-  char *buf = malloc(len);
-  if (buf == NULL) {
+  /* Write to a temp file next to the target, then rename over it so an
+   * interrupted save never leaves the real file truncated or empty. */
+  size_t tlen = strlen(target);
+  char *tmp = malloc(tlen + 8);
+  if (tmp == NULL) {
     editor_set_status_message("Save failed: out of memory");
+    free(resolved);
+    return;
+  }
+  snprintf(tmp, tlen + 8, "%s.tmp", target);
+  unlink(tmp);
+
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd == -1) {
+    editor_set_status_message("Save failed: %s", strerror(errno));
+    free(tmp);
+    free(resolved);
     return;
   }
 
-  char *p = buf;
+  if (stat(target, &st) == 0) fchmod(fd, st.st_mode);
+
+  size_t total = 0;
+  int ok = 1;
+  int j;
   for (j = 0; j < E.numrows; j++) {
-    memcpy(p, E.row[j].chars, E.row[j].size);
-    p += E.row[j].size;
-    *p = '\n';
-    p++;
+    if (write_all(fd, E.row[j].chars, (size_t)E.row[j].size) == -1 ||
+        write_all(fd, "\n", 1) == -1) {
+      ok = 0;
+      editor_set_status_message("Save failed: write");
+      break;
+    }
+    total += (size_t)E.row[j].size + 1;
   }
 
-  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
-  if (fd != -1) {
-    if (ftruncate(fd, 0) != -1) {
-      if (write(fd, buf, len) == len) {
-        editor_set_status_message("%d bytes written", len);
-E.dirty = 0;
+  if (ok && fsync(fd) == -1) {
+    ok = 0;
+    editor_set_status_message("Save failed: fsync");
+  }
+  close(fd);
 
-  U.undo = NULL;
-  U.undo_n = 0;
-  U.undo_cap = 0;
-  U.redo = NULL;
-  U.redo_n = 0;
-  U.redo_cap = 0;
-  U.locked = 0;
-      } else {
-        editor_set_status_message("Save failed: short write");
-      }
-    } else {
-      editor_set_status_message("Save failed: truncate");
-    }
-    close(fd);
-  } else {
+  if (ok && rename(tmp, target) == -1) {
+    unlink(tmp);
+    ok = 0;
     editor_set_status_message("Save failed: %s", strerror(errno));
   }
+  free(tmp);
+  free(resolved);
 
-  free(buf);
+  if (!ok) return;
+
+  editor_set_status_message("%zu bytes written", total);
+  E.dirty = 0;
+  saved_snapshot_take();
 }
 
 void editor_open(char *filename) {
@@ -965,6 +1195,7 @@ void editor_open(char *filename) {
   free(line);
   fclose(fp);
   E.dirty = 0;
+  saved_snapshot_take();
 }
 
 void editor_help(void) {
@@ -1010,6 +1241,7 @@ void editor_help(void) {
   free(ab.b);
 
   editor_read_key();
+  force_full = 1;
 }
 
 void editor_process_keypress(void) {
@@ -1096,6 +1328,9 @@ void editor_process_keypress(void) {
       break;
 
     case CTRL_KEY('l'):
+      force_full = 1;
+      break;
+
     case '\x1b':
       break;
 
@@ -1105,6 +1340,26 @@ void editor_process_keypress(void) {
   }
 
   quit_times = KILO_QUIT_TIMES;
+}
+
+void editor_cleanup(void) {
+  saved_snapshot_free();
+  cache_invalidate();
+  free(cache_lines);
+  free(cache_lens);
+  free(cache_caps);
+  cache_lines = NULL;
+  cache_lens = NULL;
+  cache_caps = NULL;
+  cache_alloc = 0;
+  free(welcome_buf);
+  welcome_buf = NULL;
+  welcome_cap = 0;
+  free(last_query);
+  last_query = NULL;
+  editor_free_undo_redo();
+  free(E.filename);
+  E.filename = NULL;
 }
 
 void init_editor(void) {
@@ -1124,10 +1379,14 @@ void init_editor(void) {
     die("get_window_size");
   E.screenrows -= 2;
   if (E.screenrows < 1) E.screenrows = 1;
+  last_wsrows = E.screenrows + 2;
+  last_wscols = E.screencols;
+  force_full = 1;
 }
 
 int main(int argc, char *argv[]) {
   enable_raw_mode();
+  atexit(editor_cleanup);
   init_editor();
   if (argc >= 2) editor_open(argv[1]);
 
