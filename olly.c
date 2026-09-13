@@ -273,6 +273,15 @@ void enable_raw_mode(void) {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 
+static int read_byte(unsigned char *c) {
+  return read(STDIN_FILENO, c, 1) == 1;
+}
+
+/* Escape sequences are consumed in full, to their terminating byte, even when
+ * the result is a key we do not map. A sequence that was only partly consumed
+ * used to leave its tail in the input stream, where it arrived as ordinary
+ * characters and was inserted into the buffer -- pressing Ctrl-Right, for
+ * example, typed a literal "5C" into the file. */
 int editor_read_key(void) {
   int nread;
   unsigned char c;
@@ -280,46 +289,61 @@ int editor_read_key(void) {
     if (nread == -1 && errno != EAGAIN) die("read");
   }
 
-  if (c == '\x1b') {
-    char seq[3];
-    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
-    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+  if (c != '\x1b') return c;
 
-    if (seq[0] == '[') {
-      if (seq[1] >= '0' && seq[1] <= '9') {
-        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
-        if (seq[2] == '~') {
-          switch (seq[1]) {
-            case '1': return HOME_KEY;
-            case '3': return DEL_KEY;
-            case '4': return END_KEY;
-            case '5': return PAGE_UP;
-            case '6': return PAGE_DOWN;
-            case '7': return HOME_KEY;
-            case '8': return END_KEY;
-          }
-        }
-      } else {
-        switch (seq[1]) {
-          case 'A': return ARROW_UP;
-          case 'B': return ARROW_DOWN;
-          case 'C': return ARROW_RIGHT;
-          case 'D': return ARROW_LEFT;
-          case 'H': return HOME_KEY;
-          case 'F': return END_KEY;
-        }
-      }
-    } else if (seq[0] == 'O') {
-      switch (seq[1]) {
-        case 'H': return HOME_KEY;
-        case 'F': return END_KEY;
-      }
+  unsigned char b;
+  if (!read_byte(&b)) return '\x1b';
+
+  if (b == '[') {
+    /* CSI: parameter bytes 0x30-0x3f, intermediates 0x20-0x2f, then a final
+     * byte in 0x40-0x7e. Modifiers ride in the parameters (Ctrl-Right is
+     * "\x1b[1;5C"), so the final byte alone selects the key. */
+    char params[24];
+    size_t n = 0;
+    unsigned char final;
+    for (;;) {
+      if (!read_byte(&b)) return '\x1b';
+      if (b >= 0x40 && b <= 0x7e) { final = b; break; }
+      if (n < sizeof(params) - 1) params[n++] = (char)b;
     }
+    params[n] = '\0';
 
+    switch (final) {
+      case 'A': return ARROW_UP;
+      case 'B': return ARROW_DOWN;
+      case 'C': return ARROW_RIGHT;
+      case 'D': return ARROW_LEFT;
+      case 'H': return HOME_KEY;
+      case 'F': return END_KEY;
+      case '~':
+        switch (atoi(params)) {
+          case 1: return HOME_KEY;
+          case 3: return DEL_KEY;
+          case 4: return END_KEY;
+          case 5: return PAGE_UP;
+          case 6: return PAGE_DOWN;
+          case 7: return HOME_KEY;
+          case 8: return END_KEY;
+        }
+        break;
+    }
     return '\x1b';
-  } else {
-    return c;
   }
+
+  if (b == 'O') {
+    /* SS3, sent for the cursor keys in application mode. */
+    if (!read_byte(&b)) return '\x1b';
+    switch (b) {
+      case 'A': return ARROW_UP;
+      case 'B': return ARROW_DOWN;
+      case 'C': return ARROW_RIGHT;
+      case 'D': return ARROW_LEFT;
+      case 'H': return HOME_KEY;
+      case 'F': return END_KEY;
+    }
+  }
+
+  return '\x1b';
 }
 
 int get_cursor_position(int *rows, int *cols) {
@@ -1014,11 +1038,18 @@ static int editor_search_string(const char *query, int qlen, int dir,
 
   int n = E.numrows;
   int k;
-  for (k = 0; k < n; k++) {
-    int i = dir > 0 ? (E.cy + k) % n : (E.cy - k + n) % n;
+  if (n == 0) return 0;
+  /* The cursor may sit on the phantom line past the last row; anchor the
+   * sweep to a real row in that case. */
+  int cur = (E.cy >= n) ? 0 : E.cy;
+  /* k runs to n inclusive, so the starting row is visited a second time at
+   * the end of the wrap. Only then is it scanned from its beginning, which
+   * is what makes a match earlier on the cursor's own line reachable. */
+  for (k = 0; k <= n; k++) {
+    int i = dir > 0 ? (cur + k) % n : ((cur - k) % n + n) % n;
     erow *row = &E.row[i];
     int maxstart = row->rsize - qlen;
-    int on_start_row = (i == E.cy);
+    int on_start_row = (i == E.cy) && (k == 0);
     if (dir > 0) {
       int start = on_start_row ? (exclude_current ? E.rx + 1 : E.rx) : 0;
       int col;
@@ -1094,13 +1125,62 @@ void editor_find_prev(void) {
     editor_set_status_message("Not found. Press Ctrl-N to search forward");
 }
 
+/* Write every row, newline-terminated, to an already-open descriptor. */
+static int editor_write_rows(int fd, size_t *total) {
+  size_t n = 0;
+  int j;
+  for (j = 0; j < E.numrows; j++) {
+    if (write_all(fd, E.row[j].chars, (size_t)E.row[j].size) == -1 ||
+        write_all(fd, "\n", 1) == -1)
+      return -1;
+    n += (size_t)E.row[j].size + 1;
+  }
+  *total = n;
+  return 0;
+}
+
+/* A rename is only durable once the directory entry itself is on disk. */
+static void fsync_parent_dir(const char *path) {
+  char *copy = strdup(path);
+  if (copy == NULL) return;
+
+  char *slash = strrchr(copy, '/');
+  const char *dir;
+  if (slash == NULL) dir = ".";
+  else if (slash == copy) dir = "/";
+  else { *slash = '\0'; dir = copy; }
+
+  int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd != -1) {
+    fsync(dfd);
+    close(dfd);
+  }
+  free(copy);
+}
+
+/* The mode a newly created file should end up with, honouring the umask. */
+static mode_t default_file_mode(void) {
+  mode_t um = umask(0);
+  umask(um);
+  return 0666 & ~um;
+}
+
 void editor_save(void) {
   if (E.filename == NULL) {
-    E.filename = editor_prompt("Save as: %s (ESC to cancel)", NULL);
-    if (E.filename == NULL) {
+    char *name = editor_prompt("Save as: %s (ESC to cancel)", NULL);
+    if (name == NULL) {
       editor_set_status_message("Save aborted");
       return;
     }
+    /* An empty answer must not become the file name: it can never be saved
+     * to, and because it is non-NULL it would suppress this prompt forever,
+     * stranding the buffer with no way to write it out. */
+    if (name[0] == '\0') {
+      free(name);
+      editor_set_status_message("Save aborted: no file name given");
+      return;
+    }
+    E.filename = name;
   }
 
   /* If the name is a symlink, write past it to the real target so atomic
@@ -1117,52 +1197,83 @@ void editor_save(void) {
     target = resolved;
   }
 
-  /* Write to a temp file next to the target, then rename over it so an
-   * interrupted save never leaves the real file truncated or empty. */
+  mode_t mode = (stat(target, &st) == 0) ? (st.st_mode & 07777)
+                                         : default_file_mode();
+
+  /* Write to a unique temp file next to the target, then rename over it, so
+   * an interrupted save never leaves the real file truncated or empty.
+   * mkstemp creates the file exclusively under a name nobody can predict:
+   * a fixed "<target>.tmp" both clobbered any real file of that name and
+   * let a local attacker win the race between unlink and open, redirecting
+   * the write through a symlink of their choosing. */
   size_t tlen = strlen(target);
-  char *tmp = malloc(tlen + 8);
+  char *tmp = malloc(tlen + sizeof(".XXXXXX"));
   if (tmp == NULL) {
     editor_set_status_message("Save failed: out of memory");
     free(resolved);
     return;
   }
-  snprintf(tmp, tlen + 8, "%s.tmp", target);
-  unlink(tmp);
+  memcpy(tmp, target, tlen);
+  memcpy(tmp + tlen, ".XXXXXX", sizeof(".XXXXXX"));
 
-  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  size_t total = 0;
+  int fd = mkstemp(tmp);
+
   if (fd == -1) {
-    editor_set_status_message("Save failed: %s", strerror(errno));
+    /* No room to create a sibling temp file -- typically a writable file in
+     * a read-only directory. Fall back to rewriting the file in place, which
+     * still saves the user's work, but say so: this write is not atomic. */
+    int direct = open(target, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC |
+                              O_NOFOLLOW, mode);
+    if (direct == -1) {
+      editor_set_status_message("Save failed: %s", strerror(errno));
+      free(tmp);
+      free(resolved);
+      return;
+    }
+    int dok = (editor_write_rows(direct, &total) == 0);
+    if (dok && fsync(direct) == -1) dok = 0;
+    if (close(direct) == -1) dok = 0;
     free(tmp);
     free(resolved);
+    if (!dok) {
+      editor_set_status_message("Save failed: %s", strerror(errno));
+      return;
+    }
+    editor_set_status_message("%zu bytes written (in place, not atomic)",
+        total);
+    E.dirty = 0;
+    saved_snapshot_take();
     return;
   }
 
-  if (stat(target, &st) == 0) fchmod(fd, st.st_mode);
-
-  size_t total = 0;
   int ok = 1;
-  int j;
-  for (j = 0; j < E.numrows; j++) {
-    if (write_all(fd, E.row[j].chars, (size_t)E.row[j].size) == -1 ||
-        write_all(fd, "\n", 1) == -1) {
-      ok = 0;
-      editor_set_status_message("Save failed: write");
-      break;
-    }
-    total += (size_t)E.row[j].size + 1;
+  /* Not fatal if it fails: the file is saved either way, only its mode is off.
+   * mkstemp creates at 0600, so the content is never briefly world-readable. */
+  (void)fchmod(fd, mode);
+
+  if (editor_write_rows(fd, &total) == -1) {
+    ok = 0;
+    editor_set_status_message("Save failed: %s", strerror(errno));
   }
 
   if (ok && fsync(fd) == -1) {
     ok = 0;
     editor_set_status_message("Save failed: fsync");
   }
-  close(fd);
-
-  if (ok && rename(tmp, target) == -1) {
-    unlink(tmp);
+  if (close(fd) == -1 && ok) {
     ok = 0;
     editor_set_status_message("Save failed: %s", strerror(errno));
   }
+
+  if (ok && rename(tmp, target) == -1) {
+    ok = 0;
+    editor_set_status_message("Save failed: %s", strerror(errno));
+  }
+
+  if (ok) fsync_parent_dir(target);
+  else unlink(tmp);
+
   free(tmp);
   free(resolved);
 

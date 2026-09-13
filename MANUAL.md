@@ -129,7 +129,31 @@ undo it. Any edit made after an undo clears the redo history — a fresh
 | `Ctrl-S` | Save the file |
 | `Ctrl-Q` | Quit |
 
-If the buffer has no file name yet, `Ctrl-S` first asks where to save.
+If the buffer has no file name yet, `Ctrl-S` first asks where to save. An
+empty answer cancels the save rather than being taken as a file name, so the
+buffer keeps its unnamed state and `Ctrl-S` will ask again next time.
+
+### How a save is written
+
+Olly does not write over your file directly. It creates a uniquely named
+temporary file beside the target, writes the buffer there, flushes it to disk,
+and only then renames it into place. A save that is interrupted — by a crash,
+a full disk, or the power going out — therefore leaves the original file
+untouched rather than half-written. The temporary name is unpredictable and
+created exclusively, so it can never collide with a file of your own and
+cannot be redirected by anything else in the directory.
+
+Two consequences are worth knowing:
+
+- Saving replaces the file, so any **hard links** to it are broken: the other
+  names keep the old contents.
+- Renaming requires a writable **directory**. If the file is writable but its
+  directory is not, Olly falls back to rewriting the file in place and says
+  `written (in place, not atomic)` — your work is saved, but that particular
+  write has no crash protection.
+
+When the file name is a symbolic link, Olly follows it and replaces the file
+it points at, leaving the link itself alone.
 
 Olly protects you from losing work: when there are unsaved changes, the first
 few presses of `Ctrl-Q` only confirm that you really want to quit, and a

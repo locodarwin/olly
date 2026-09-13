@@ -28,7 +28,10 @@ install: olly
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/olly $(LOCALBIN)/olly
 
+test: olly
+	python3 tests/test_olly.py ./olly
+
 clean:
 	rm -f olly editor
 
-.PHONY: clean install uninstall
+.PHONY: clean install uninstall test

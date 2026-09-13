@@ -1,2 +1,5 @@
 olly
 *.o
+olly_asan
+olly_vuln
+__pycache__/
