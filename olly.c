@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -196,6 +197,73 @@ static int utf8_strlen(const char *s, int size) {
     n++;
   }
   return n;
+}
+
+/* Decode the character at index i to a code point, and report its byte length.
+ * An invalid or truncated sequence decodes as its single lead byte. */
+static uint32_t utf8_decode(const char *s, int size, int i, int *nbytes) {
+  int n = utf8_char_bytes(s, size, i);
+  *nbytes = n;
+  unsigned char c = (unsigned char)s[i];
+  if (n == 1) return c;
+  uint32_t cp = c & (0x7F >> n);
+  int k;
+  for (k = 1; k < n; k++)
+    cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+  return cp;
+}
+
+/* --- display width: how many terminal columns a code point occupies. Built
+ * in rather than via wcwidth(), so it does not depend on the process locale
+ * and the editor stays self-contained. Zero for combining marks, two for the
+ * East Asian wide and fullwidth ranges, one otherwise. The interval tables
+ * follow Markus Kuhn's reference wcwidth (public domain). --- */
+
+struct interval { uint32_t first, last; };
+
+static int in_table(uint32_t cp, const struct interval *t, int n) {
+  int lo = 0, hi = n - 1;
+  if (cp < t[0].first || cp > t[hi].last) return 0;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    if (cp > t[mid].last) lo = mid + 1;
+    else if (cp < t[mid].first) hi = mid - 1;
+    else return 1;
+  }
+  return 0;
+}
+
+static int olly_wcwidth(uint32_t cp) {
+  static const struct interval zero[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x0610, 0x061A},
+    {0x064B, 0x065F}, {0x0670, 0x0670}, {0x06D6, 0x06DC}, {0x06DF, 0x06E4},
+    {0x0711, 0x0711}, {0x0730, 0x074A}, {0x07A6, 0x07B0}, {0x07EB, 0x07F3},
+    {0x0816, 0x0823}, {0x0900, 0x0903}, {0x093A, 0x094F}, {0x0951, 0x0957},
+    {0x0E31, 0x0E31}, {0x0E34, 0x0E3A}, {0x0EB1, 0x0EB1}, {0x0EB4, 0x0EBC},
+    {0x1AB0, 0x1AFF}, {0x1DC0, 0x1DFF}, {0x20D0, 0x20F0}, {0xFE20, 0xFE2F},
+    {0x1F3FB, 0x1F3FF}, {0xE0100, 0xE01EF}
+  };
+  static const struct interval wide[] = {
+    {0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC},
+    {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F},
+    {0x2693, 0x2693}, {0x26A1, 0x26A1}, {0x26AA, 0x26AB}, {0x26BD, 0x26BE},
+    {0x2753, 0x2755}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2E80, 0x303E},
+    {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF},
+    {0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F},
+    {0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x1F300, 0x1F64F}, {0x1F900, 0x1F9FF},
+    {0x20000, 0x3FFFD}
+  };
+  if (cp == 0) return 0;
+  if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0)) return 1;  /* control: 1 cell */
+  if (in_table(cp, zero, (int)(sizeof(zero) / sizeof(zero[0])))) return 0;
+  if (in_table(cp, wide, (int)(sizeof(wide) / sizeof(wide[0])))) return 2;
+  return 1;
+}
+
+/* Display columns of the character at index i (tabs are the caller's job). */
+static int utf8_char_cols(const char *s, int size, int i, int *nbytes) {
+  uint32_t cp = utf8_decode(s, size, i, nbytes);
+  return olly_wcwidth(cp);
 }
 
 /* --- saved-content snapshot: the buffer is only "modified" when it really
@@ -806,25 +874,58 @@ void editor_redo(void) {
   editor_set_status_message("Redo");
 }
 
+/* Display column of the cursor at byte offset cx: tabs advance to the next
+ * tab stop, other characters advance by their display width (0 for combining
+ * marks, 2 for wide glyphs). This is what positions the on-screen cursor and
+ * drives horizontal scrolling. */
 int editor_row_cx_to_rx(erow *row, int cx) {
-  int rx = 0;
-  int j;
-  for (j = 0; j < cx; j++) {
-    if (row->chars[j] == '\t')
-      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
-    rx++;
+  int rx = 0, j = 0;
+  while (j < cx) {
+    if (row->chars[j] == '\t') {
+      rx += KILO_TAB_STOP - (rx % KILO_TAB_STOP);
+      j++;
+    } else {
+      int nb;
+      rx += utf8_char_cols(row->chars, row->size, j, &nb);
+      j += nb;
+    }
   }
   return rx;
 }
 
-int editor_row_rx_to_cx(erow *row, int rx) {
-  int cur_rx = 0;
-  int cx;
-  for (cx = 0; cx < row->size; cx++) {
-    if (row->chars[cx] == '\t')
-      cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
-    cur_rx++;
-    if (cur_rx > rx) return cx;
+/* Byte offset of the cursor within render (tabs expand to spaces there). The
+ * search matches on render bytes, so it needs the cursor as a render byte
+ * offset, not as a display column. */
+static int editor_row_cx_to_rbyte(erow *row, int cx) {
+  int rb = 0, j = 0;
+  while (j < cx) {
+    if (row->chars[j] == '\t') {
+      rb += KILO_TAB_STOP - (rb % KILO_TAB_STOP);
+      j++;
+    } else {
+      int nb = utf8_char_bytes(row->chars, row->size, j);
+      rb += nb;
+      j += nb;
+    }
+  }
+  return rb;
+}
+
+/* Inverse of the above: map a render byte offset (where a search matched) back
+ * to a byte offset in chars. */
+static int editor_render_byte_to_cx(erow *row, int rbyte) {
+  int rb = 0, cx = 0;
+  while (cx < row->size) {
+    int nb;
+    if (row->chars[cx] == '\t') {
+      rb += KILO_TAB_STOP - (rb % KILO_TAB_STOP);
+      nb = 1;
+    } else {
+      nb = utf8_char_bytes(row->chars, row->size, cx);
+      rb += nb;
+    }
+    if (rb > rbyte) return cx;
+    cx += nb;
   }
   return row->size;
 }
@@ -1048,6 +1149,61 @@ void editor_scroll(void) {
   if (E.rx >= E.coloff + E.screencols) E.coloff = E.rx - E.screencols + 1;
 }
 
+/* Scratch buffer for the bytes of one drawn row (a horizontal slice, possibly
+ * with a leading pad space where a wide glyph is cut by the scroll edge). */
+static char *drawbuf;
+static int drawbuf_cap;
+
+static void drawbuf_ensure(int n) {
+  if (drawbuf_cap >= n) return;
+  drawbuf_cap = drawbuf_cap ? drawbuf_cap * 2 : 256;
+  if (drawbuf_cap < n) drawbuf_cap = n;
+  drawbuf = xrealloc(drawbuf, (size_t)drawbuf_cap);
+}
+
+/* Draw one text row, honouring display width: horizontal scroll (coloff) and
+ * the screen width are measured in columns, so a slice starts and ends on
+ * character boundaries. A wide glyph split by either edge is dropped and the
+ * gap shown as a space, keeping every following column aligned. */
+static void editor_draw_text_row(struct abuf *ab, int y, erow *row) {
+  const char *r = row->render;
+  int rs = row->rsize;
+  int col = 0, i = 0;
+
+  /* Skip whole characters that lie entirely left of the viewport. */
+  while (i < rs && col < E.coloff) {
+    int nb, w = utf8_char_cols(r, rs, i, &nb);
+    if (col + w > E.coloff) break;
+    col += w;
+    i += nb;
+  }
+  /* A wide glyph straddling the left edge is dropped; its visible right half
+   * becomes that many leading spaces. */
+  int left_pad = 0;
+  if (i < rs && col < E.coloff) {
+    int nb, w = utf8_char_cols(r, rs, i, &nb);
+    left_pad = (col + w) - E.coloff;
+    i += nb;
+  }
+
+  int start = i;
+  int cols = left_pad;
+  while (i < rs && cols < E.screencols) {
+    int nb, w = utf8_char_cols(r, rs, i, &nb);
+    if (cols + w > E.screencols) break;  /* would overflow the right edge */
+    cols += w;
+    i += nb;
+  }
+
+  int slice = i - start;
+  drawbuf_ensure(left_pad + slice + 1);
+  int p = 0;
+  while (p < left_pad) drawbuf[p++] = ' ';
+  if (slice > 0) memcpy(drawbuf + p, r + start, (size_t)slice);
+  p += slice;
+  cache_line_draw(ab, y, drawbuf, p, 0);
+}
+
 void editor_draw_rows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows; y++) {
@@ -1085,10 +1241,7 @@ void editor_draw_rows(struct abuf *ab) {
         cache_line_draw(ab, y, "~", 1, 0);
       }
     } else {
-      int len = E.row[filerow].rsize - E.coloff;
-      if (len < 0) len = 0;
-      if (len > E.screencols) len = E.screencols;
-      cache_line_draw(ab, y, E.row[filerow].render + E.coloff, len, 0);
+      editor_draw_text_row(ab, y, &E.row[filerow]);
     }
   }
 }
@@ -1242,6 +1395,10 @@ static int editor_search_string(const char *query, int qlen, int dir,
   /* The cursor may sit on the phantom line past the last row; anchor the
    * sweep to a real row in that case. */
   int cur = (E.cy >= n) ? 0 : E.cy;
+  /* The cursor's position as a render byte offset -- render is what strncasecmp
+   * scans, and the cursor's display column (E.rx) is no longer the same thing
+   * once a line holds wide or combining characters. */
+  int cur_rb = editor_row_cx_to_rbyte(&E.row[cur], E.cx);
   /* k runs to n inclusive, so the starting row is visited a second time at
    * the end of the wrap. Only then is it scanned from its beginning, which
    * is what makes a match earlier on the cursor's own line reachable. */
@@ -1251,24 +1408,24 @@ static int editor_search_string(const char *query, int qlen, int dir,
     int maxstart = row->rsize - qlen;
     int on_start_row = (i == E.cy) && (k == 0);
     if (dir > 0) {
-      int start = on_start_row ? (exclude_current ? E.rx + 1 : E.rx) : 0;
+      int start = on_start_row ? (exclude_current ? cur_rb + 1 : cur_rb) : 0;
       int col;
       for (col = start; col <= maxstart; col++) {
         if (strncasecmp(row->render + col, query, qlen) == 0) {
           E.cy = i;
-          E.cx = editor_row_rx_to_cx(row, col);
+          E.cx = editor_render_byte_to_cx(row, col);
           return 1;
         }
       }
     } else {
-      int start = on_start_row ? (exclude_current ? E.rx - 1 : E.rx)
+      int start = on_start_row ? (exclude_current ? cur_rb - 1 : cur_rb)
                                : maxstart;
       if (start > maxstart) start = maxstart;
       int col;
       for (col = start; col >= 0; col--) {
         if (strncasecmp(row->render + col, query, qlen) == 0) {
           E.cy = i;
-          E.cx = editor_row_rx_to_cx(row, col);
+          E.cx = editor_render_byte_to_cx(row, col);
           return 1;
         }
       }
@@ -1727,6 +1884,9 @@ void editor_cleanup(void) {
   free(welcome_buf);
   welcome_buf = NULL;
   welcome_cap = 0;
+  free(drawbuf);
+  drawbuf = NULL;
+  drawbuf_cap = 0;
   free(last_query);
   last_query = NULL;
   editor_free_undo_redo();

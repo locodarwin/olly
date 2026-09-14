@@ -129,6 +129,19 @@ def run_until_signal(argv, sig, rows=24, cols=80, startup=0.5, keys=()):
     return before, during, after, wstatus
 
 
+def cursor_col(out):
+    """The column of the last cursor-position escape the program emitted.
+
+    Each frame ends by moving the hardware cursor with \x1b[<row>;<col>H, so
+    the final such escape in the output is where the cursor came to rest.
+    """
+    import re
+
+    text = out.decode("latin-1")
+    matches = re.findall(r"\x1b\[(\d+);(\d+)H", text)
+    return int(matches[-1][1]) if matches else None
+
+
 def status_lines(out, rows=24):
     """The message-bar texts olly painted, oldest first."""
     import re

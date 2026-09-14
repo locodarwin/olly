@@ -206,6 +206,7 @@ After saving, the undo history is kept, but the dirty flag is cleared.
 - Text is stored and saved as raw bytes, so UTF-8 (and any other encoding)
   round-trips unchanged. The cursor, `Backspace` and `Delete` operate on whole
   UTF-8 characters rather than individual bytes, and the `Col` indicator counts
-  characters. On-screen column alignment for double-width or combining
-  characters is approximate.
+  characters. Display width is honoured: East Asian wide characters take two
+  columns, combining marks take none, so the cursor and horizontal scrolling
+  stay aligned with what the terminal actually shows.
 - The status bar shows the file name capped at 20 characters.

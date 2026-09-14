@@ -21,7 +21,8 @@ all in a single C file with zero external dependencies.
   endings (`LF` or `CRLF`), a missing final newline, and the file's mode and
   owner are all preserved.
 - **UTF-8-aware editing** — the cursor, `Backspace` and `Delete` move over
-  whole characters, and text round-trips as raw bytes.
+  whole characters, text round-trips as raw bytes, and display width is
+  honoured so wide (CJK) and combining characters stay aligned on screen.
 - **Crash recovery** — if a signal or an out-of-memory condition kills Olly
   with unsaved changes, the buffer is written to a `.olly-recover` file.
 - **Open anything** — never errors on a missing file; it simply starts an
