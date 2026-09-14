@@ -9,6 +9,7 @@ so a failure means a real regression rather than a style drift.
 
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -324,10 +325,10 @@ def test_utf8(tmpdir):
     path = os.path.join(tmpdir, "col.txt")
     with open(path, "wb") as fh:
         fh.write(cafe)
-    # café is four characters but five bytes; the status bar's Col must report
-    # the character position (5 at end of line), never the byte position (6).
+    # café is four columns but five bytes; the status bar's Col reports the
+    # display column (5 at end of line), never the byte position (6).
     out = run([OLLY, path], [END])
-    check("column counts characters, not bytes",
+    check("column reflects display position, not bytes",
           b"Col 5" in out and b"Col 6" not in out, True)
     found = (status_lines(run([OLLY, path], [HOME, "\x06", "é", "\r"]))
              or [""])[-1]
@@ -362,6 +363,29 @@ def test_wide(tmpdir):
     col = cursor_after("あ" * 40 + "\n", [END], )
     check("cursor stays within a narrow window of wide glyphs",
           col is not None and col <= 80, True)
+
+
+def test_status_col(tmpdir):
+    print("\nstatus bar: Col reports the display column, matching the cursor")
+
+    def status_col(body, keys):
+        path = os.path.join(tmpdir, "sc.txt")
+        with open(path, "wb") as fh:
+            fh.write(body.encode("utf-8"))
+        text = run([OLLY, path], keys).decode("utf-8", "replace")
+        m = re.findall(r"Ln \d+, Col (\d+)", text)
+        return int(m[-1]) if m else None
+
+    # Regression: Col was a character count, so it disagreed with the cursor on
+    # any line with a tab or a wide glyph -- a leading tab read Col 2 while the
+    # cursor sat at column 9. Col now follows the display column.
+    check("plain ASCII end of line", status_col("hello\n", [END]), 6)
+    check("a leading tab reaches the tab stop",
+          status_col("\thello\n", [END]), 14)
+    check("a tab mid-line", status_col("a\tb\n", [END]), 10)
+    check("a wide glyph counts as two columns",
+          status_col("aあb\n", [END]), 5)
+    check("home is always column 1", status_col("\thello\n", [END, HOME]), 1)
 
 
 # ---------------------------------------------------------- file format ----
@@ -462,6 +486,7 @@ def main():
         test_tab(tmpdir)
         test_utf8(tmpdir)
         test_wide(tmpdir)
+        test_status_col(tmpdir)
         test_search(tmpdir)
         test_save(tmpdir)
         test_line_endings(tmpdir)

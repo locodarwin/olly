@@ -189,16 +189,6 @@ static int utf8_prev(const char *s, int i) {
   return j;
 }
 
-/* Number of characters in s[0..size). */
-static int utf8_strlen(const char *s, int size) {
-  int i = 0, n = 0;
-  while (i < size) {
-    i += utf8_char_bytes(s, size, i);
-    n++;
-  }
-  return n;
-}
-
 /* Decode the character at index i to a code point, and report its byte length.
  * An invalid or truncated sequence decodes as its single lead byte. */
 static uint32_t utf8_decode(const char *s, int size, int i, int *nbytes) {
@@ -1255,11 +1245,12 @@ void editor_draw_status_bar(struct abuf *ab) {
   int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
       E.filename ? E.filename : "[No Name]", E.numrows,
       E.dirty ? "(modified)" : "");
-  int col = (E.cy < E.numrows)
-      ? utf8_strlen(E.row[E.cy].chars, E.cx) + 1
-      : E.cx + 1;
+  /* Report the display column, so the number matches where the cursor sits:
+   * E.rx already accounts for tab stops and character widths (a leading tab
+   * puts the cursor at column 9, not column 2). A plain character count
+   * disagreed with the cursor on any line with a tab or a wide character. */
   int rlen = snprintf(rstatus, sizeof(rstatus), "Ln %d, Col %d",
-      E.cy + 1, col);
+      E.cy + 1, E.rx + 1);
   if (len > E.screencols) len = E.screencols;
   ab_append(ab, status, len);
   /* Right-align the cursor position when it fits; otherwise pad to the edge. */
