@@ -219,7 +219,7 @@ successful save removes any recovery file for that name, and so does a clean
 
 After saving, the undo history is kept, but the dirty flag is cleared.
 
-## Keys At a Glance
+## Keyboard Shortcuts
 
     Ctrl-S   Save file
     Ctrl-Q   Quit (asks several times if there are unsaved changes)
