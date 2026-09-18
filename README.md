@@ -4,38 +4,38 @@ A small, dependency-free text editor for the terminal, written in C11.
 
 Olly is a modeless editor in the spirit of nano: start typing and you're
 editing. It offers incremental search that wraps around the file, grouped
-undo/redo, automatic empty-file creation, and careful, atomic save handling —
-all in a single C file with zero external dependencies.
+undo/redo, automatic empty-file creation, and careful, atomic save handling. 
+All this in a single C file with zero external dependencies.
 
 ## Features
 
-- **Modeless editing** — type to insert, arrow keys to move, `Ctrl` keys act.
+- **Modeless editing**: type to insert, arrow keys to move, `Ctrl` keys act.
 - **Search, with a case-sensitivity toggle**, that wraps around the file and
   remembers the last term:
   - `Ctrl-F` search, `Ctrl-N` next match, `Ctrl-P` previous match, or just
     press `Ctrl-F` again with an empty query to repeat.
   - `Ctrl-T` toggles between case-insensitive (the default) and
     case-sensitive matching.
-- **Search and replace** — `Ctrl-R` replaces the next match or every match,
+- **Search and replace**: `Ctrl-R` replaces the next match or every match,
   and a whole replace-all undoes or redoes as one step.
-- **Go to line** — `Ctrl-G` jumps straight to a line number.
-- **Grouped undo/redo** — a run of typed (or deleted) characters, or a
+- **Go to line**: `Ctrl-G` jumps straight to a line number.
+- **Grouped undo/redo**: a run of typed (or deleted) characters, or a
   replace-all, undoes as one step. `Ctrl-Z` undo, `Ctrl-Y` redo.
-- **Atomic saves** — the file is written to a private temporary file and
+- **Atomic saves**: the file is written to a private temporary file and
   renamed into place, so an interrupted save never leaves it truncated. Line
   endings (`LF` or `CRLF`), a missing final newline, and the file's mode and
   owner are all preserved. If the file changed on disk since it was opened,
   Olly asks before overwriting it.
-- **UTF-8-aware editing** — the cursor, `Backspace` and `Delete` move over
+- **UTF-8-aware editing**: the cursor, `Backspace` and `Delete` move over
   whole characters, text round-trips as raw bytes, and display width is
   honoured so wide (CJK) and combining characters stay aligned on screen.
-- **Crash recovery** — if a signal or an out-of-memory condition kills Olly
+- **Crash recovery**: if a signal or an out-of-memory condition kills Olly
   with unsaved changes, the buffer is written to a `.olly-recover` file.
-- **Open anything** — never errors on a missing file; it simply starts an
+- **Open anything**: never errors on a missing file; it simply starts an
   empty buffer.
-- **Dirty-quit protection** — when there are unsaved changes, `Ctrl-Q` asks
+- **Dirty-quit protection**: when there are unsaved changes, `Ctrl-Q` asks
   several times before exiting (counted down in the status bar).
-- **Keyboard reference built in** — press `Ctrl-?` at any time.
+- **Keyboard reference built in**: press `Ctrl-?` at any time.
 - No runtime dependencies. Compiles with any C11 compiler.
 
 ## Install
@@ -54,9 +54,9 @@ make install
 
 Its default install location is `/usr/local/bin`; if that directory isn't
 writable (a very common situation), `make install` detects this and falls
-back to `~/.local/bin` automatically — no `sudo` needed. You can override the
+back to `~/.local/bin` automatically - no `sudo` needed. You can override the
 target with `make install PREFIX=/some/dir` or stage a package with
-`make install DESTDIR=/wherever`. `make uninstall` removes it.
+`make install DESTDIR=/wherever`. `make uninstall` to remove it.
 
 ## Usage
 
@@ -66,13 +66,13 @@ olly file.txt        # open an existing file
 olly new.txt         # open a buffer for a file that doesn't exist yet
 ```
 
-Edit immediately — every key you type is inserted at the cursor. Save with
+Edit immediately. Every key you type is inserted at the cursor. Save with
 `Ctrl-S`, search with `Ctrl-F`, and keep an eye on the status bar: it shows
 the file name, line count, modified state, and the cursor as
-`Ln <line>, Col <column>` (the character column, not the on-screen display
-column). The display resizes live as you resize the terminal window.
+`Ln <line>, Col <column>`. The display resizes live as you resize the terminal
+window.
 
-## Keys At a Glance
+## Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
