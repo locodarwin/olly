@@ -37,6 +37,14 @@ PASSED = 0
 
 HOME, END = "\x1b[H", "\x1b[F"
 UP, DOWN, RIGHT, LEFT = "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"
+# Shifted variants: CSI form "\x1b[1;2<final>" -- the ";2" is the Shift
+# modifier. These are the keys that extend a selection.
+SH_UP, SH_DOWN, SH_RIGHT, SH_LEFT = ("\x1b[1;2A", "\x1b[1;2B",
+                                     "\x1b[1;2C", "\x1b[1;2D")
+SH_HOME, SH_END = "\x1b[1;2H", "\x1b[1;2F"
+
+# Clipboard keys (raw mode clears ISIG, so Ctrl-C reaches the editor as a byte).
+COPY, CUT, PASTE = "\x03", "\x18", "\x16"
 
 
 def run_interleaved(argv, before_keys, touch, after_keys, rows=24, cols=80):
@@ -617,6 +625,211 @@ def test_status_col(tmpdir):
     check("home is always column 1", status_col("\thello\n", [END, HOME]), 1)
 
 
+# ---------------------------------------------------------- selection ----
+
+def test_selection(tmpdir):
+    print("\nselection: Shift+arrow extends a selection (status-bar byte count)")
+
+    def sel(body, keys, name="sel.txt"):
+        path = os.path.join(tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(body.encode("utf-8"))
+        text = run([OLLY, path], keys).decode("utf-8", "replace")
+        # The status bar is the reverse-video line at row `rows-1`; take its
+        # last frame so earlier frames' "Sel" text cannot mask a clear.
+        ms = re.findall(r"\x1b\[%d;1H\x1b\[7m([^\x1b]*)" % 23, text)
+        if not ms:
+            return None
+        m = re.search(r"Sel (\d+)", ms[-1])
+        return int(m.group(1)) if m else None
+
+    # Extending right counts bytes to the right of the anchor.
+    check("shift-right x2 selects 2", sel("abcd\n", [SH_RIGHT, SH_RIGHT]), 2)
+    check("shift-right x3 selects 3",
+          sel("abcd\n", [SH_RIGHT, SH_RIGHT, SH_RIGHT]), 3)
+    check("shift-end selects to end of line", sel("abcd\n", [RIGHT, SH_END]), 3)
+    check("shift-left selects backwards",
+          sel("abcd\n", [END, SH_LEFT, SH_LEFT]), 2)
+    # Crossing one line break adds one byte for that break.
+    check("shift-down spans the first row plus a break", sel("ab\ncd\n", [SH_DOWN]), 3)
+
+    # A plain move, or an edit, drops the selection (no "Sel" in the bar).
+    check("a plain arrow clears the selection",
+          sel("abcd\n", [SH_RIGHT, SH_RIGHT, RIGHT]), None)
+    check("typing clears the selection", sel("abcd\n", [SH_RIGHT, "X"]), None)
+
+    # Shifted keys must never type into the buffer nor corrupt it.
+    check("shifted keys type nothing",
+          edit(tmpdir, "abcd\n", [SH_RIGHT, SH_RIGHT, SH_LEFT, SAVE]), "abcd\n")
+
+
+# -------------------------------------------------------- clipboard ----
+
+def test_clipboard(tmpdir):
+    print("\nclipboard: Ctrl-C/X/V copy, cut and paste the selection")
+    sel_ab = [SH_RIGHT, SH_RIGHT]      # select "ab" from column 0
+
+    check("copy then paste", edit(tmpdir, "abcd\n", sel_ab + [COPY, END, PASTE, SAVE]),
+          "abcdab\n")
+    check("cut removes the selection",
+          edit(tmpdir, "abcd\n", sel_ab + [CUT, SAVE]), "cd\n")
+    check("cut then paste at another spot",
+          edit(tmpdir, "abcd\nef\n", sel_ab + [CUT, DOWN, END, PASTE, SAVE]),
+          "cd\nefab\n")
+    check("multi-line copy and paste",
+          edit(tmpdir, "ab\ncd\n", [SH_DOWN, SH_RIGHT, SH_RIGHT, COPY, DOWN, PASTE, SAVE]),
+          "ab\ncd\nab\ncd\n")
+
+    # Editing keys consume the selection (replace-on-type).
+    check("typing replaces selection",
+          edit(tmpdir, "hello\n", [SH_RIGHT] * 5 + ["X", SAVE]), "X\n")
+    check("backspace deletes selection",
+          edit(tmpdir, "hello\n", [SH_RIGHT] * 5 + ["\x1b[3~", SAVE]), "\n")
+    check("enter replaces selection",
+          edit(tmpdir, "hello\n", [SH_RIGHT] * 5 + ["\r", SAVE]), "\n\n")
+
+    # Copy keeps the selection alive, so the next edit still replaces it.
+    check("copy keeps the selection",
+          edit(tmpdir, "abcd\n", sel_ab + [COPY, "Z", SAVE]), "Zcd\n")
+
+    # Each is a single undo step.
+    check("cut undoes as one step",
+          edit(tmpdir, "hello world\n", [SH_RIGHT] * 5 + [CUT, UNDO, SAVE]),
+          "hello world\n")
+    check("paste undoes as one step",
+          edit(tmpdir, "ab\n", sel_ab + [COPY, END, PASTE, UNDO, SAVE]), "ab\n")
+
+    # Pasting with an empty clipboard is a no-op, not a crash.
+    check("paste of empty clipboard", edit(tmpdir, "hello\n", [PASTE, SAVE]),
+          "hello\n")
+
+
+# ------------------------------------------------- selection highlight ----
+
+def test_selection_highlight(tmpdir):
+    print("\nselection highlight: selected text is drawn in reverse video")
+
+    def raw(body, keys, name="hl.txt"):
+        path = os.path.join(tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(body.encode("utf-8"))
+        return run([OLLY, path], keys).decode("utf-8", "replace")
+
+    # The status bar paints in reverse video too, but resets with ESC[m, so
+    # ESC[27m -- which only the row highlight emits -- uniquely marks selected
+    # buffer text. Selecting "abc" must wrap exactly those glyphs.
+    sel = raw("abcd\n", [SH_RIGHT, SH_RIGHT, SH_RIGHT])
+    check("selected glyphs are highlighted", "\x1b[7mabc\x1b[27m" in sel, True)
+    check("highlight ends with a reverse-video reset", "\x1b[27m" in sel, True)
+    check("unselected tail stays outside the highlight",
+          "\x1b[7mabc\x1b[27md" in sel, True)
+
+    # With no selection there is no reverse-video reset anywhere in the stream.
+    plain = raw("abcd\n", ["\x0c"])  # Ctrl-L = full repaint
+    check("no highlight without a selection", "\x1b[27m" in plain, False)
+
+    # A multi-line selection highlights the top row's tail and the next row's
+    # head as two independent reverse-video runs.
+    multi = raw("abcd\nefgh\n", [SH_RIGHT, SH_DOWN, SH_RIGHT])
+    check("multi-line: top row tail highlighted",
+          "\x1b[7mabcd\x1b[27m" in multi, True)
+    check("multi-line: next row head highlighted",
+          "\x1b[7mef\x1b[27mgh" in multi, True)
+
+
+# ------------------------------------------------------- osc 52 clipboard ----
+
+def test_osc52_clipboard(tmpdir):
+    print("\nosc52: copy/cut also set the system clipboard; paste is literal")
+
+    def raw(body, keys, name="osc.txt"):
+        path = os.path.join(tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(body.encode("utf-8"))
+        return run([OLLY, path], keys).decode("latin-1")
+
+    # OSC 52 wraps the base64 of the clipboard: ESC ] 52 ; c ; <b64> BEL.
+    # base64("ab") == "YWI=". Selecting the first two chars and copying must
+    # push exactly that, so a terminal-native paste yields what was copied.
+    o = raw("abcd\n", [SH_RIGHT, SH_RIGHT, COPY])
+    check("copy emits an OSC 52 clipboard set", "\x1b]52;c;YWI=\x07" in o, True)
+
+    # Cut pushes it too (and still deletes the selection).
+    oc = raw("abcd\n", [SH_RIGHT, SH_RIGHT, CUT])
+    check("cut emits an OSC 52 clipboard set", "\x1b]52;c;YWI=\x07" in oc, True)
+
+    # A copy must not touch the buffer, and copy+paste still round-trips.
+    check("copy leaves the buffer intact",
+          edit(tmpdir, "abcd\n", [SH_RIGHT, SH_RIGHT, COPY, SAVE]), "abcd\n")
+    check("copy then paste is unaffected",
+          edit(tmpdir, "abcd\n", [SH_RIGHT, SH_RIGHT, COPY, END, PASTE, SAVE]),
+          "abcdab\n")
+
+    # Bracketed paste is disabled at startup, so terminal-pasted text arrives as
+    # plain keystrokes rather than ESC[200~...~ wrappers Olly can't parse.
+    check("bracketed paste disabled at startup",
+          "\x1b[?2004l" in raw("x\n", []), True)
+
+
+# --------------------------------------------------------------- help ----
+
+HELP = "\x1f"  # Ctrl-?
+
+def test_help(tmpdir):
+    print("\nhelp: documents every keybind; two columns wide, one narrow")
+    path = os.path.join(tmpdir, "help.txt")
+    with open(path, "w") as fh:
+        fh.write("x\n")
+
+    def out(cols, rows=40, keys=(HELP,)):
+        return run([OLLY, path], list(keys), rows=rows, cols=cols).decode("utf-8", "replace")
+
+    wide = out(cols=80)
+    check("help has a title", "Keyboard Reference" in wide, True)
+    # Every keybinding and group heading must be documented somewhere.
+    for token in ["FILES", "MOVEMENT", "SELECTION", "EDITING",
+                  "FIND & REPLACE", "CLIPBOARD", "HISTORY", "VIEW",
+                  "Ctrl-S", "Ctrl-Q", "Ctrl-?", "Ctrl-G", "Ctrl-F", "Ctrl-N",
+                  "Ctrl-P", "Ctrl-T", "Ctrl-R", "Ctrl-Z", "Ctrl-Y", "Ctrl-C",
+                  "Ctrl-X", "Ctrl-V", "Ctrl-L", "Shift+Arrows", "PgUp/PgDn",
+                  "Home/End", "Bksp/Ctrl-H", "Enter accepts", "Esc cancels"]:
+        check("help lists %s" % token, token in wide, True)
+
+    # Wide screens use the two-column layout; narrow ones fall back to one.
+    check("wide uses two columns", "FILES" in wide and "CLIPBOARD" in wide, True)
+    narrow = out(cols=48)
+    check("narrow still shows everything",
+          "FILES" in narrow and "Ctrl-V" in narrow, True)
+
+    # A short screen gains a scroll hint (content taller than the screen).
+    short = out(cols=80, rows=8)
+    check("short screen offers scrolling", "scroll" in short, True)
+
+    # Two-column means a single physical row carries a left and a right group
+    # title together; one-column never does. help_row composes each row into one
+    # write, so splitting the stream at every row-set cursor move isolates one
+    # physical row per fragment.
+    def two_col(text):
+        return any("FILES" in seg and "FIND & REPLACE" in seg
+                   for seg in re.split(r"\x1b\[\d+;\d+H", text))
+
+    check("wide help is two columns", two_col(wide), True)
+    check("narrow help is one column", two_col(narrow), False)
+
+    # Resizing while help is open must reflow it live, not keep the size it
+    # opened at. Open wide, then shrink below the two-column threshold; the last
+    # repaint (taken after the final full-screen clear) is the post-resize one.
+    live = run([OLLY, path], [HELP, (24, 40)],
+               rows=24, cols=100).decode("utf-8", "replace")
+    check("live resize: two columns while wide", two_col(live), True)
+    last = live.rsplit("\x1b[2J", 1)[-1]
+    check("live resize: still help after the resize",
+          "Keyboard Reference" in last, True)
+    check("live resize: reflowed to one column when narrow",
+          two_col(last), False)
+    check("live resize: content survives the reflow", "FILES" in last, True)
+
+
 # ---------------------------------------------------------- file format ----
 
 def test_line_endings(tmpdir):
@@ -716,6 +929,11 @@ def main():
         test_utf8(tmpdir)
         test_wide(tmpdir)
         test_status_col(tmpdir)
+        test_selection(tmpdir)
+        test_clipboard(tmpdir)
+        test_selection_highlight(tmpdir)
+        test_osc52_clipboard(tmpdir)
+        test_help(tmpdir)
         test_search(tmpdir)
         test_case_sensitive_search(tmpdir)
         test_goto_line(tmpdir)

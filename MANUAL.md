@@ -11,6 +11,7 @@ the arrow keys move around, and the `Ctrl` combinations do the work.
 - [Getting Started](#getting-started)
 - [Editing](#editing)
 - [Moving Around](#moving-around)
+- [Selecting Text](#selecting-text)
 - [Searching](#searching)
 - [Search and Replace](#search-and-replace)
 - [Undo and Redo](#undo-and-redo)
@@ -88,6 +89,9 @@ end of a line joins the next line onto it.
 | `Ctrl-G` | Go to a line number |
 | `Ctrl-L` | Repaint the screen |
 
+Hold `Shift` while using the arrows, `Home`/`End`, or `PgUp`/`PgDn` to move the
+cursor and select text along the way — see [Selecting Text](#selecting-text).
+
 `Ctrl-G` prompts for a line number and moves the cursor to the start of that
 line. A number past the last line goes to the last line instead; a number
 below 1 goes to the first line. Anything that is not a valid number leaves
@@ -95,6 +99,55 @@ the cursor where it was.
 
 The terminal can also be resized freely while Olly is running — the display
 adjusts to the new size as it happens, without needing a keypress first.
+
+## Help Screen
+
+`Ctrl-?` opens a keyboard reference. It lays out in two columns on a wide
+terminal and drops to a single column when the window is narrower, scrolling
+with the arrows, `PgUp`/`PgDn`, `Home`/`End` when the content is taller than the
+screen. Resizing the terminal **while the help screen is open** reflows it live —
+it re-reads the size and switches between the one- and two-column layouts to
+match, without leaving the screen. Press any other key to return to the editor.
+
+## Selecting Text
+
+Hold `Shift` and use the movement keys to select a region between the anchor
+(where the selection started) and the cursor. The selected text is shown in
+reverse video as you extend it, and the status bar shows a `Sel <bytes>` count
+while a selection is active.
+
+| Key | Action |
+| --- | --- |
+| `Shift` + `←` `↑` `↓` `→` | Extend or shrink the selection |
+| `Shift` + `Home` / `End` | Select to the start / end of the line |
+| `Shift` + `PgUp` / `PgDn` | Extend the selection up / down a screenful |
+| `Ctrl-C` | Copy the selection to the clipboard |
+| `Ctrl-X` | Cut the selection (copy, then delete it) |
+| `Ctrl-V` | Paste the clipboard at the cursor |
+
+A selection is a rectangular-free, character-wise range: it always grows and
+shrinks on whole character boundaries, so it never splits a multi-byte (UTF-8)
+character. Pressing any movement key **without** `Shift`, or clicking/editing
+elsewhere, clears the selection first.
+
+Editing replaces the selection in one step: typing a character, `Enter`,
+`Backspace` or `Delete` deletes the selected range and then does its normal
+thing. `Ctrl-C` deliberately leaves the selection in place so you can copy the
+same range again.
+
+Pasting inserts the clipboard at the cursor (replacing any current selection);
+embedded newlines split lines. A cut and a paste each undo (and redo) as a
+single step with `Ctrl-Z` / `Ctrl-Y`.
+
+Copying and cutting also push the selection to your **system (terminal)
+clipboard** with the OSC 52 escape sequence, so it can be pasted into other
+applications — and pasted back into Olly with the terminal's own paste binding
+(right-click, `Ctrl-Shift-V`, …), which is handy when a terminal intercepts
+`Ctrl-V` and would otherwise paste an unrelated application's clipboard. This
+depends on your terminal honouring OSC 52 (some disable it by default for
+security); where it is off, Olly's own `Ctrl-V` still pastes its internal
+buffer. Olly does not *read* the system clipboard — `Ctrl-V` pastes only what
+Olly last copied or cut.
 
 ## Searching
 
@@ -152,6 +205,8 @@ Changes are aggregated this way:
 - Line splits, line joins, and row insertions likewise undo as one step.
 - A replace-all (see [Search and Replace](#search-and-replace)) undoes and
   redoes as one step, however many occurrences it changed.
+- A cut (`Ctrl-X`) and a paste (`Ctrl-V`) each undo and redo as one step,
+  however many characters or lines they span.
 
 Typing a character on a brand-new auto-created row records two changes (the
 row itself, then the character), so it takes two `Ctrl-Z` presses to fully
@@ -229,10 +284,14 @@ After saving, the undo history is kept, but the dirty flag is cleared.
     Ctrl-T   Toggle case-sensitive search
     Ctrl-R   Search and replace (next or all)
     Ctrl-G   Go to line
+    Ctrl-C   Copy the selection
+    Ctrl-X   Cut the selection
+    Ctrl-V   Paste the clipboard at the cursor
     Ctrl-Z   Undo the last change
     Ctrl-Y   Redo an undone change
     Ctrl-?   Show this help screen
     Ctrl-L   Repaint the screen
+    Shift    Hold with arrows / Home / End / PgUp / PgDn to select
     Esc      Cancel the current prompt
 
 ## File Format Notes

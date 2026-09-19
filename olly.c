@@ -20,7 +20,7 @@
 
 #define KILO_TAB_STOP 8
 #define KILO_QUIT_TIMES 3
-#define OLLY_VERSION "1.0"
+#define OLLY_VERSION "1.1"
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -55,6 +55,10 @@ struct editorConfig {
   int numrows;
   int rowcap;         /* allocated capacity of row[], grown by doubling */
   int dirty;
+  int sel_active;     /* a selection is in progress (anchor + cursor) */
+  int sx, sy;         /* selection anchor; the cursor (cx,cy) is the far end */
+  char *clipboard;    /* in-editor clipboard for Ctrl-C/X/V; kept across files */
+  int clipsize;       /* bytes held in clipboard (not necessarily NUL-terminated) */
   int eol_crlf;       /* write \r\n line endings, as the loaded file used */
   int final_newline;  /* the file ended with a newline (so the save should) */
   erow *row;
@@ -516,6 +520,13 @@ void enable_raw_mode(void) {
   raw.c_cc[VTIME] = 1;
 
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+
+  /* Turn bracketed paste off even if the terminal or a parent shell left it
+   * on. Olly does not parse the "\x1b[200~...\x1b[201~" wrappers, so with the
+   * mode on a paste would arrive as a stray DEL key (the "\x1b[...~" prefix)
+   * plus literal text; off, a paste is just literal keystrokes and inserts
+   * cleanly. */
+  write_all(STDOUT_FILENO, "\x1b[?2004l", 8);
 }
 
 static int read_byte(unsigned char *c) {
@@ -527,9 +538,16 @@ static int read_byte(unsigned char *c) {
  * used to leave its tail in the input stream, where it arrived as ordinary
  * characters and was inserted into the buffer -- pressing Ctrl-Right, for
  * example, typed a literal "5C" into the file. */
+/* Set by editor_read_key when the key just returned arrived with the Shift
+ * modifier (CSI form, e.g. Shift+Right is "\x1b[1;2C"). Read by
+ * editor_process_keypress to extend a selection; smuggled out-of-band like
+ * WINCH_KEY so the key enum stays a plain int. Reset on every call. */
+static int last_key_shift = 0;
+
 int editor_read_key(void) {
   int nread;
   unsigned char c;
+  last_key_shift = 0;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
     if (nread == -1 && errno != EAGAIN) die("read");
     /* VMIN=0/VTIME=1 already wakes this loop roughly every 100ms even with
@@ -559,6 +577,18 @@ int editor_read_key(void) {
       if (n < sizeof(params) - 1) params[n++] = (char)b;
     }
     params[n] = '\0';
+
+    /* The modifier, if any, rides after the ';' in the parameters ("\x1b[1;2C"
+     * = Shift+Right). The value is one more than a bitfield (shift=1, alt=2,
+     * ctrl=4), so a set low bit means Shift was held. Only consumed as a
+     * side signal; the returned key is still selected by `final`, and the
+     * sequence is always read to its terminator so nothing leaks to the
+     * buffer regardless. */
+    char *semi = strchr(params, ';');
+    if (semi != NULL) {
+      int mod = atoi(semi + 1);
+      if (mod >= 2) last_key_shift = (mod - 1) & 0x01;
+    }
 
     switch (final) {
       case 'A': return ARROW_UP;
@@ -1233,6 +1263,230 @@ void editor_scroll(void) {
   if (E.rx >= E.coloff + E.screencols) E.coloff = E.rx - E.screencols + 1;
 }
 
+/* --- selection: an anchor (sx,sy) plus the live cursor (cx,cy). Movement with
+ * Shift held extends it (setting the anchor on the first shifted move); any
+ * other key drops it. The covered text is highlighted in reverse video by
+ * editor_draw_text_row(), and the byte count is surfaced in the status bar. --- */
+
+static void selection_clear(void) {
+  E.sel_active = 0;
+}
+
+/* Order the anchor and cursor into a top-left / bottom-right pair, clamped to
+ * valid rows so the phantom line past the last row never indexes out of
+ * bounds. Returns 0 (leaving the outputs undefined) when no selection. */
+static int selection_range(int *ax, int *ay, int *bx, int *by) {
+  if (!E.sel_active) return 0;
+  int y0 = E.sy, y1 = E.cy, x0 = E.sx, x1 = E.cx;
+  if (y0 > y1 || (y0 == y1 && x0 > x1)) {
+    int ty = y0, tx = x0;
+    y0 = y1; x0 = x1; y1 = ty; x1 = tx;
+  }
+  if (y0 < 0) y0 = 0;
+  if (y1 > E.numrows) y1 = E.numrows;
+  *ay = y0; *ax = x0; *by = y1; *bx = x1;
+  /* The phantom line past the last row has no characters, so a selection that
+   * runs off the end of the buffer always ends at column 0 of it. */
+  if (*by == E.numrows) *bx = 0;
+  return 1;
+}
+
+/* Bytes spanned by the selection, counting one per internal line break. Used
+ * only for the status-bar count, so whether a line break is "one byte" is a
+ * display choice rather than a correctness one. */
+static int selection_bytes(void) {
+  int ax, ay, bx, by;
+  if (!selection_range(&ax, &ay, &bx, &by)) return 0;
+  if (ay == by) {
+    int sz = (ay < E.numrows) ? E.row[ay].size : 0;
+    if (ax < 0) ax = 0;
+    if (bx > sz) bx = sz;
+    return (bx > ax) ? bx - ax : 0;
+  }
+  int total = 0;
+  if (ay < E.numrows) total += E.row[ay].size - ax;
+  int i;
+  for (i = ay + 1; i < by && i < E.numrows; i++) total += E.row[i].size;
+  total += bx;
+  total += (by - ay);
+  return total;
+}
+
+/* The selected display-column range on row 'filerow' as absolute columns
+ * [out0, out1); out1 <= out0 when no text on this row is selected. Selection
+ * endpoints are byte offsets into row->chars, mapped through
+ * editor_row_cx_to_rx() so the highlight lands on the rendered glyphs (tab
+ * stops and wide glyphs already accounted for). The whole interior span of a
+ * multi-line selection is covered; the top row starts at the anchor and the
+ * bottom row ends at the far edge. */
+static void selection_row_rx(int filerow, int *out0, int *out1) {
+  *out0 = 0;
+  *out1 = 0;
+  int ax, ay, bx, by;
+  if (!selection_range(&ax, &ay, &bx, &by)) return;
+  if (filerow < ay || filerow > by || filerow >= E.numrows) return;
+  erow *r = &E.row[filerow];
+  if (ay == by) {
+    if (bx > ax) {
+      *out0 = editor_row_cx_to_rx(r, ax);
+      *out1 = editor_row_cx_to_rx(r, bx);
+    }
+  } else if (filerow == ay) {
+    *out0 = editor_row_cx_to_rx(r, ax);
+    *out1 = editor_row_cx_to_rx(r, r->size);
+  } else if (filerow == by) {
+    *out1 = editor_row_cx_to_rx(r, bx);
+  } else {
+    *out1 = editor_row_cx_to_rx(r, r->size);
+  }
+  if (*out1 < *out0) *out1 = *out0;
+}
+
+/* Copy the selected bytes into a freshly allocated, NUL-terminated buffer
+ * (internal line breaks become '\n'), matching selection_bytes()'s count. The
+ * caller frees it. Returns NULL with *outlen 0 when the selection is empty. */
+static char *selection_dup(int *outlen) {
+  int ax, ay, bx, by;
+  *outlen = 0;
+  if (!selection_range(&ax, &ay, &bx, &by)) return NULL;
+  if (ay == by && ax == bx) return NULL;
+
+  int size;
+  if (ay == by) {
+    size = bx - ax;
+  } else {
+    size = (E.row[ay].size - ax) + 1;   /* tail of the top row + its newline */
+    int i;
+    for (i = ay + 1; i < by && i < E.numrows; i++) size += E.row[i].size + 1;
+    size += bx;                          /* head of the bottom row */
+  }
+  char *buf = xmalloc((size_t)size + 1);
+  int pos = 0;
+  if (ay == by) {
+    memcpy(buf + pos, E.row[ay].chars + ax, (size_t)(bx - ax));
+    pos += bx - ax;
+  } else {
+    memcpy(buf + pos, E.row[ay].chars + ax, (size_t)(E.row[ay].size - ax));
+    pos += E.row[ay].size - ax;
+    buf[pos++] = '\n';
+    int i;
+    for (i = ay + 1; i < by && i < E.numrows; i++) {
+      memcpy(buf + pos, E.row[i].chars, (size_t)E.row[i].size);
+      pos += E.row[i].size;
+      buf[pos++] = '\n';
+    }
+    if (by < E.numrows) {
+      memcpy(buf + pos, E.row[by].chars, (size_t)bx);
+      pos += bx;
+    }
+  }
+  buf[pos] = '\0';
+  *outlen = pos;
+  return buf;
+}
+
+/* Replace the clipboard contents. Allocate before releasing the old buffer:
+ * if the allocation failed after the free, die()'s atexit cleanup would free
+ * the stale E.clipboard a second time. Allocating first means a failure dies
+ * with the clipboard still intact. */
+static void clipboard_set(const char *s, int len) {
+  char *buf = (len > 0) ? xmalloc((size_t)len) : NULL;
+  if (len > 0) memcpy(buf, s, (size_t)len);
+  free(E.clipboard);
+  E.clipboard = buf;
+  E.clipsize = (len > 0) ? len : 0;
+}
+
+/* Delete the selected range, leaving the cursor at its start. Walks the far
+ * end back to the near end with the tested single-character editor_delete_char
+ * (which handles multibyte characters and line joins itself), so the selection
+ * is always consumed on character boundaries. The whole run is one undo step.
+ * No-op (just clears the selection) when it is empty. */
+static void selection_delete(void) {
+  int ax, ay, bx, by;
+  if (!selection_range(&ax, &ay, &bx, &by)) return;
+  selection_clear();
+  if (ay == by && ax == bx) return;
+
+  undo_group_begin();
+  if (by == E.numrows) {
+    if (E.numrows == 0) { undo_group_end(); return; }
+    E.cy = E.numrows - 1;
+    E.cx = E.row[E.numrows - 1].size;
+  } else {
+    E.cy = by;
+    E.cx = bx;
+  }
+  while (!(E.cy == ay && E.cx == ax)) editor_delete_char();
+  undo_group_end();
+}
+
+/* Insert the clipboard at the cursor as one undo step; embedded newlines split
+ * lines. An active selection is replaced. */
+static void editor_paste(void) {
+  if (E.clipsize == 0) {
+    editor_set_status_message("Clipboard is empty");
+    return;
+  }
+  selection_delete();
+  undo_group_begin();
+  int i;
+  for (i = 0; i < E.clipsize; i++) {
+    if (E.clipboard[i] == '\n') editor_insert_newline();
+    else editor_insert_char(E.clipboard[i]);
+  }
+  undo_group_end();
+  editor_set_status_message("Pasted %d bytes", E.clipsize);
+}
+
+/* Push the clipboard to the terminal's *system* clipboard with OSC 52, so a
+ * terminal-native paste (or a Ctrl-V that the terminal intercepts and serves
+ * from the system clipboard itself) yields exactly what Olly copied, and what
+ * Olly copied can be pasted into other applications too. Without this the
+ * in-editor clipboard is invisible to the terminal, so a paste shows whatever
+ * an unrelated application last left on the system clipboard.
+ *
+ * Written straight to the terminal in fixed chunks: it allocates nothing, so a
+ * failed copy can never die here after the in-editor clipboard already landed.
+ * Strictly best-effort -- terminals that ignore OSC 52 (or have it disabled)
+ * just keep their own clipboard, and Olly's own Ctrl-V still pastes the
+ * internal buffer. */
+static void clipboard_sync_system(void) {
+  static const char tbl[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  static const char hdr[] = "\x1b]52;c;";
+  const unsigned char *in = (const unsigned char *)E.clipboard;
+  int len = E.clipsize;
+  if (len <= 0) return;
+  write_all(STDOUT_FILENO, hdr, sizeof(hdr) - 1);
+
+  char chunk[512];
+  int c = 0, i = 0;
+  while (i + 3 <= len) {
+    unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8) | in[i + 2];
+    chunk[c++] = tbl[(v >> 18) & 63];
+    chunk[c++] = tbl[(v >> 12) & 63];
+    chunk[c++] = tbl[(v >> 6) & 63];
+    chunk[c++] = tbl[v & 63];
+    i += 3;
+    if (c + 4 > (int)sizeof(chunk)) {  /* room for one more group, else flush */
+      write_all(STDOUT_FILENO, chunk, (size_t)c);
+      c = 0;
+    }
+  }
+  if (i < len) {
+    int rem = len - i;
+    unsigned v = (unsigned)in[i] << 16;
+    if (rem > 1) v |= (unsigned)in[i + 1] << 8;
+    chunk[c++] = tbl[(v >> 18) & 63];
+    chunk[c++] = tbl[(v >> 12) & 63];
+    chunk[c++] = rem > 1 ? tbl[(v >> 6) & 63] : '=';
+    chunk[c++] = '=';
+  }
+  if (c) write_all(STDOUT_FILENO, chunk, (size_t)c);
+  write_all(STDOUT_FILENO, "\x07", 1);  /* BEL terminator (widely accepted) */
+}
+
 /* Scratch buffer for the bytes of one drawn row (a horizontal slice, possibly
  * with a leading pad space where a wide glyph is cut by the scroll edge). */
 static char *drawbuf;
@@ -1248,8 +1502,15 @@ static void drawbuf_ensure(int n) {
 /* Draw one text row, honouring display width: horizontal scroll (coloff) and
  * the screen width are measured in columns, so a slice starts and ends on
  * character boundaries. A wide glyph split by either edge is dropped and the
- * gap shown as a space, keeping every following column aligned. */
-static void editor_draw_text_row(struct abuf *ab, int y, erow *row) {
+ * gap shown as a space, keeping every following column aligned.
+ *
+ * Characters whose display-column range overlaps [sel0, sel1) are wrapped in
+ * reverse video. The escape codes occupy no display columns, so they never
+ * disturb alignment, and because they live in the cached drawbuf a change of
+ * selection changes the row's bytes and forces just that row to redraw. When
+ * there is no selection the emitted bytes are identical to before. */
+static void editor_draw_text_row(struct abuf *ab, int y, erow *row,
+                                 int sel0, int sel1) {
   const char *r = row->render;
   int rs = row->rsize;
   int col = 0, i = 0;
@@ -1268,23 +1529,39 @@ static void editor_draw_text_row(struct abuf *ab, int y, erow *row) {
     int nb, w = utf8_char_cols(r, rs, i, &nb);
     left_pad = (col + w) - E.coloff;
     i += nb;
+    col += w;
   }
 
-  int start = i;
-  int cols = left_pad;
-  while (i < rs && cols < E.screencols) {
-    int nb, w = utf8_char_cols(r, rs, i, &nb);
-    if (cols + w > E.screencols) break;  /* would overflow the right edge */
-    cols += w;
-    i += nb;
-  }
-
-  int slice = i - start;
-  drawbuf_ensure(left_pad + slice + 1);
+  /* Emit the visible slice, toggling reverse video at the selection edges.
+   * Worst case per character is one render glyph plus both escape sequences,
+   * so size the buffer against the whole render length, not the visible width:
+   * a run of zero-width combining marks can consume every column budget-free
+   * iteration. */
+  int has_sel = (sel1 > sel0);
+  drawbuf_ensure(left_pad + rs * 12 + 16);
   int p = 0;
   while (p < left_pad) drawbuf[p++] = ' ';
-  if (slice > 0) memcpy(drawbuf + p, r + start, (size_t)slice);
-  p += slice;
+
+  int dcol = col;      /* absolute display column of the character at i */
+  int vis = left_pad;  /* visible columns emitted so far */
+  int in_sel = 0;
+  while (i < rs && vis < E.screencols) {
+    int nb, w = utf8_char_cols(r, rs, i, &nb);
+    if (vis + w > E.screencols) break;  /* would overflow the right edge */
+    int sel = has_sel && dcol >= sel0 && dcol < sel1;
+    if (sel != in_sel) {
+      if (sel) { memcpy(drawbuf + p, "\x1b[7m", 4); p += 4; }
+      else { memcpy(drawbuf + p, "\x1b[27m", 5); p += 5; }
+      in_sel = sel;
+    }
+    memcpy(drawbuf + p, r + i, (size_t)nb);
+    p += nb;
+    vis += w;
+    dcol += w;
+    i += nb;
+  }
+  if (in_sel) { memcpy(drawbuf + p, "\x1b[27m", 5); p += 5; }
+
   cache_line_draw(ab, y, drawbuf, p, 0);
 }
 
@@ -1325,7 +1602,9 @@ void editor_draw_rows(struct abuf *ab) {
         cache_line_draw(ab, y, "~", 1, 0);
       }
     } else {
-      editor_draw_text_row(ab, y, &E.row[filerow]);
+      int s0, s1;
+      selection_row_rx(filerow, &s0, &s1);
+      editor_draw_text_row(ab, y, &E.row[filerow], s0, s1);
     }
   }
 }
@@ -1346,8 +1625,11 @@ void editor_draw_status_bar(struct abuf *ab) {
    * the phantom line past the last row, which has no erow to index. */
   int charcol = (E.cy < E.numrows)
       ? editor_row_cx_to_charcol(&E.row[E.cy], E.cx) : 0;
-  int rlen = snprintf(rstatus, sizeof(rstatus), "Ln %d, Col %d",
-      E.cy + 1, charcol + 1);
+  int rlen = E.sel_active
+      ? snprintf(rstatus, sizeof(rstatus), "Ln %d, Col %d  Sel %d",
+          E.cy + 1, charcol + 1, selection_bytes())
+      : snprintf(rstatus, sizeof(rstatus), "Ln %d, Col %d",
+          E.cy + 1, charcol + 1);
   if (len > E.screencols) len = E.screencols;
   ab_append(ab, status, len);
   /* Right-align the cursor position when it fits; otherwise pad to the edge. */
@@ -1989,62 +2271,241 @@ void editor_open(char *filename) {
   saved_snapshot_take();
 }
 
-void editor_help(void) {
-  const char *lines[] = {
-    "Olly - Help",
-    "",
-    "Movement:   Arrow keys, Page Up/Page Down, Home/End",
-    "Editing:    Type characters, Enter inserts a new line",
-    "            Backspace/Delete remove characters before/at the cursor",
-    "",
-    "Commands:",
-    "  Ctrl-S       Save the file",
-    "  Ctrl-F       Search forward (case-insensitive by default)",
-    "  Ctrl-N       Find the next instance of the search",
-    "  Ctrl-P       Find the previous instance of the search",
-    "  Ctrl-T       Toggle case-sensitive search",
-    "  Ctrl-R       Search and replace (next or all)",
-    "  Ctrl-G       Go to line",
-    "  Ctrl-Z       Undo the last change",
-    "  Ctrl-Y       Redo an undone change",
-    "  Ctrl-Q       Quit (asks several times if there are unsaved changes)",
-    "  Ctrl-?       Show this help screen",
-    "",
-    "Press any key to return to the editor"
-  };
-  int nlines = sizeof(lines) / sizeof(lines[0]);
-  int start = (E.screenrows - nlines) / 2;
-  if (start < 0) start = 0;
+/* ---- help screen: data + layout --------------------------------------- *
+ * Every keybinding lives here, grouped by function. The renderer drops to a
+ * single column when the terminal is narrow and scrolls when the content is
+ * taller than the screen, so nothing is ever clipped. */
+struct help_item { const char *key; const char *desc; };
+struct help_group { const char *title; const struct help_item *items; };
 
-  struct abuf ab = ABUF_INIT;
-  ab_append(&ab, "\x1b[2J", 4);
-  ab_append(&ab, "\x1b[?25l", 6);
+static const struct help_item help_items_files[] = {
+  {"Ctrl-S",   "Save file"},
+  {"Ctrl-Q",   "Quit"},
+  {"Ctrl-?",   "This help screen"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_movement[] = {
+  {"Arrows",       "Move cursor"},
+  {"PgUp/PgDn",    "Page up / down"},
+  {"Home/End",     "Line start / end"},
+  {"Ctrl-G",       "Go to line"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_selection[] = {
+  {"Shift+Arrows",   "Extend selection"},
+  {"Shift+Home/End", "To line edge"},
+  {"Shift+PgUp/Dn",  "Extend by page"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_editing[] = {
+  {"Enter",      "Insert new line"},
+  {"Tab",        "Insert tab"},
+  {"Bksp/Ctrl-H","Delete before"},
+  {"Del",        "Delete at cursor"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_find[] = {
+  {"Ctrl-F", "Find forward"},
+  {"Ctrl-N", "Find next"},
+  {"Ctrl-P", "Find previous"},
+  {"Ctrl-T", "Case sensitivity"},
+  {"Ctrl-R", "Find & replace"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_clip[] = {
+  {"Ctrl-C", "Copy selection"},
+  {"Ctrl-X", "Cut selection"},
+  {"Ctrl-V", "Paste at cursor"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_history[] = {
+  {"Ctrl-Z", "Undo"},
+  {"Ctrl-Y", "Redo"},
+  {NULL, NULL}
+};
+static const struct help_item help_items_view[] = {
+  {"Ctrl-L", "Redraw screen"},
+  {NULL, NULL}
+};
 
-  char rowpos[32];
-  int i;
-  for (i = 0; i < nlines; i++) {
-    snprintf(rowpos, sizeof(rowpos), "\x1b[%d;1H", start + i + 1);
-    ab_append(&ab, rowpos, strlen(rowpos));
-    int len = strlen(lines[i]);
-    if (len > E.screencols) len = E.screencols;
-    ab_append(&ab, lines[i], len);
-    ab_append(&ab, "\x1b[K", 3);
+/* Order matters: the two-column split takes the first half vs the second. */
+static const struct help_group help_groups[] = {
+  {"FILES",          help_items_files},
+  {"MOVEMENT",       help_items_movement},
+  {"SELECTION",      help_items_selection},
+  {"EDITING",        help_items_editing},
+  {"FIND & REPLACE", help_items_find},
+  {"CLIPBOARD",      help_items_clip},
+  {"HISTORY",        help_items_history},
+  {"VIEW",           help_items_view},
+};
+
+#define HELP_WIDE 80      /* two columns at or above this width */
+#define HELP_GAP 4        /* blank columns between the two columns */
+#define HELP_KEYW 14      /* width reserved for the key name */
+#define HELP_MAXROWS 48
+#define HELP_MAXW 512
+
+static char help_lcol[HELP_MAXROWS][HELP_MAXW];
+static char help_rcol[HELP_MAXROWS][HELP_MAXW];
+static char help_line[HELP_MAXW];
+
+static void help_build_col(char col[HELP_MAXROWS][HELP_MAXW], int *rn,
+                           int g0, int g1, int keyw, int descw) {
+  int r = 0, g;
+  for (g = g0; g <= g1 && r < HELP_MAXROWS - 1; g++) {
+    if (g > g0) { col[r][0] = '\0'; r++; }
+    snprintf(col[r], HELP_MAXW, "%s", help_groups[g].title);
+    r++;
+    const struct help_item *it;
+    for (it = help_groups[g].items; it->key && r < HELP_MAXROWS - 1; it++) {
+      snprintf(col[r], HELP_MAXW, "  %-*.*s %.*s",
+               keyw, keyw, it->key, descw, it->desc);
+      r++;
+    }
   }
+  *rn = r;
+}
 
-  write_all(STDOUT_FILENO, ab.b, (size_t)ab.len);
-  free(ab.b);
+/* One composed screen row: left field padded to colw, a gap, then the right
+ * field truncated to whatever width remains. All help text is ASCII, so this
+ * byte-wise truncation can never split a multibyte character. */
+static void help_row(char *dst, int dstsz, const char *left, const char *right,
+                     int colw, int gap, int total) {
+  int rightw = total - colw - gap;
+  if (rightw < 0) rightw = 0;
+  snprintf(dst, dstsz, "%-*.*s%*s%.*s",
+           colw, colw, left, gap, "", rightw, right);
+}
 
-  /* A resize must not dismiss the overlay -- keep waiting for a real key. */
-  while (editor_read_key() == WINCH_KEY) { }
+static void help_centered(struct abuf *ab, const char *text, int row) {
+  char pos[32];
+  int pad = (E.screencols - (int)strlen(text)) / 2;
+  if (pad < 0) pad = 0;
+  snprintf(pos, sizeof(pos), "\x1b[%d;%dH", row, pad + 1);
+  ab_append(ab, pos, strlen(pos));
+  int len = strlen(text);
+  if (len > E.screencols) len = E.screencols;
+  ab_append(ab, text, len);
+  ab_append(ab, "\x1b[K", 3);
+}
+
+/* Re-read the terminal size into E.screenrows/E.screencols while help is shown.
+ * The editor's own refresh does this between keypresses, but help runs its own
+ * loop, so without this it would keep drawing at whatever size was current when
+ * it opened. Mirrors editor_refresh_screen's fallback to the last known size. */
+static void help_refresh_size(void) {
+  int wsrows, wscols;
+  if (get_window_size(&wsrows, &wscols) == -1) {
+    wsrows = last_wsrows;
+    wscols = last_wscols;
+  }
+  last_wsrows = wsrows;
+  last_wscols = wscols;
+  E.screenrows = wsrows - 2;
+  if (E.screenrows < 1) E.screenrows = 1;
+  E.screencols = wscols;
+}
+
+void editor_help(void) {
+  int scroll = 0;
+  for (;;) {
+    /* Recompute the whole layout from the live terminal size on every pass, so
+     * a resize (surfaced as WINCH_KEY) reflows one-column vs two-column, recent
+     * the title, and recomputes the scroll extent to match the new window. */
+    help_refresh_size();
+
+    int wide = (E.screencols >= HELP_WIDE);
+    int gap = wide ? HELP_GAP : 0;
+    int colw = wide ? (E.screencols - gap) / 2 : E.screencols;
+    if (colw < 1) colw = 1;
+    int keyw = HELP_KEYW;
+    if (keyw > colw - 3) keyw = (colw > 3) ? colw - 3 : 1;
+    int descw = colw - 3 - keyw;
+    if (descw < 1) descw = 1;
+
+    int ngroups = (int)(sizeof(help_groups) / sizeof(help_groups[0]));
+    int nl, nr;
+    if (wide) {
+      int mid = ngroups / 2;
+      help_build_col(help_lcol, &nl, 0, mid - 1, keyw, descw);
+      help_build_col(help_rcol, &nr, mid, ngroups - 1, keyw, descw);
+    } else {
+      help_build_col(help_lcol, &nl, 0, ngroups - 1, keyw, descw);
+      nr = 0;
+    }
+    int content = (nl > nr) ? nl : nr;
+
+    int content_top = 3;                 /* row 1 title, row 2 blank */
+    int view_h = E.screenrows - (content_top - 1) - 2; /* 2 footer rows */
+    if (view_h < 1) view_h = 1;
+    int maxscroll = content - view_h;
+    if (maxscroll < 0) maxscroll = 0;
+    if (scroll > maxscroll) scroll = maxscroll;
+    if (scroll < 0) scroll = 0;
+
+    struct abuf ab = ABUF_INIT;
+    ab_append(&ab, "\x1b[2J", 4);
+    ab_append(&ab, "\x1b[?25l", 6);
+    char pos[32];
+
+    help_centered(&ab, "Olly - Keyboard Reference", 1);
+
+    int k;
+    for (k = 0; k < view_h; k++) {
+      int idx = scroll + k;
+      if (idx >= nl && idx >= nr) break;
+      const char *L = (idx < nl) ? help_lcol[idx] : "";
+      const char *R = (idx < nr) ? help_rcol[idx] : "";
+      help_row(help_line, sizeof(help_line), L, R, colw, gap, E.screencols);
+      snprintf(pos, sizeof(pos), "\x1b[%d;1H", content_top + k);
+      ab_append(&ab, pos, strlen(pos));
+      ab_append(&ab, help_line, strlen(help_line));
+      ab_append(&ab, "\x1b[K", 3);
+    }
+
+    help_centered(&ab, "In prompts: Enter accepts   Esc cancels",
+                  E.screenrows - 1);
+    help_centered(&ab,
+        maxscroll > 0 ? "PgUp/PgDn scroll   any other key returns"
+                      : "Press any key to return to the editor",
+        E.screenrows);
+
+    write_all(STDOUT_FILENO, ab.b, (size_t)ab.len);
+    free(ab.b);
+
+    int c = editor_read_key();
+    /* A resize is not a dismiss: fall through to the top of the loop, which
+     * re-reads the size and re-lays the screen out at the new dimensions. */
+    if (c == WINCH_KEY) continue;
+    if (maxscroll == 0) break;
+    int ns = scroll;
+    if (c == ARROW_DOWN) ns = scroll + 1;
+    else if (c == ARROW_UP) ns = scroll - 1;
+    else if (c == PAGE_DOWN) ns = scroll + view_h;
+    else if (c == PAGE_UP) ns = scroll - view_h;
+    else if (c == HOME_KEY) ns = 0;
+    else if (c == END_KEY) ns = maxscroll;
+    else break;
+    if (ns < 0) ns = 0;
+    if (ns > maxscroll) ns = maxscroll;
+    scroll = ns;
+  }
   force_full = 1;
 }
 
 void editor_process_keypress(void) {
   static int quit_times = KILO_QUIT_TIMES;
   int c = editor_read_key();
+  int shift = last_key_shift;
+  int pre_cx = E.cx, pre_cy = E.cy;
+  int sel_move = (c == ARROW_UP || c == ARROW_DOWN || c == ARROW_LEFT ||
+      c == ARROW_RIGHT || c == HOME_KEY || c == END_KEY ||
+      c == PAGE_UP || c == PAGE_DOWN);
 
   switch (c) {
     case '\r':
+      if (E.sel_active) selection_delete();
       editor_insert_newline();
       break;
 
@@ -2072,6 +2533,37 @@ void editor_process_keypress(void) {
 
     case CTRL_KEY('y'):
       editor_redo();
+      break;
+
+    case CTRL_KEY('c'): {
+      /* Copy: selection to clipboard, selection kept (see the clear guard
+       * below). Ctrl-C only reaches here because raw mode clears ISIG. */
+      if (E.sel_active) {
+        int n = 0;
+        char *s = selection_dup(&n);
+        clipboard_set(s, n);
+        free(s);
+        clipboard_sync_system();
+        editor_set_status_message("Copied %d bytes", n);
+      }
+      break;
+    }
+
+    case CTRL_KEY('x'):
+      /* Cut: copy then delete the selection (one undo step). */
+      if (E.sel_active) {
+        int n = 0;
+        char *s = selection_dup(&n);
+        clipboard_set(s, n);
+        free(s);
+        clipboard_sync_system();
+        selection_delete();
+        editor_set_status_message("Cut %d bytes", n);
+      }
+      break;
+
+    case CTRL_KEY('v'):
+      editor_paste();
       break;
 
     case CTRL_KEY('f'):
@@ -2113,10 +2605,13 @@ void editor_process_keypress(void) {
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
-      if (c == DEL_KEY)
+      if (E.sel_active) {
+        selection_delete();
+      } else if (c == DEL_KEY) {
         editor_del_char();
-      else
+      } else {
         editor_delete_char();
+      }
       break;
 
     case PAGE_UP:
@@ -2152,8 +2647,25 @@ void editor_process_keypress(void) {
       /* Tab is a control character, so testing iscntrl() alone threw it
        * away and a tab could not be typed at all. Key codes of 1000 and up
        * are outside iscntrl()'s domain and must not reach it. */
-      if (c == '\t' || (c < 256 && !iscntrl(c))) editor_insert_char(c);
+      if (c == '\t' || (c < 256 && !iscntrl(c))) {
+        if (E.sel_active) selection_delete();
+        editor_insert_char(c);
+      }
       break;
+  }
+
+  /* A shifted movement extends the selection (seeding the anchor on the first
+   * one from a resting cursor). Copying keeps the selection; every other
+   * plain move, edit, or command drops it. Edits that need the selected text
+   * first consume it via selection_delete() above. */
+  if (sel_move && shift) {
+    if (!E.sel_active) {
+      E.sx = pre_cx;
+      E.sy = pre_cy;
+      E.sel_active = 1;
+    }
+  } else if (c != CTRL_KEY('c')) {
+    selection_clear();
   }
 
   quit_times = KILO_QUIT_TIMES;
@@ -2166,6 +2678,9 @@ void editor_cleanup(void) {
   E.row = NULL;
   E.numrows = 0;
   E.rowcap = 0;
+  free(E.clipboard);
+  E.clipboard = NULL;
+  E.clipsize = 0;
   saved_snapshot_free();
   cache_invalidate();
   free(cache_lines);
@@ -2201,6 +2716,11 @@ void init_editor(void) {
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
   E.dirty = 0;
+  E.sel_active = 0;
+  E.sx = 0;
+  E.sy = 0;
+  E.clipboard = NULL;
+  E.clipsize = 0;
   E.eol_crlf = 0;
   E.final_newline = 1;
   build_recovery_path();
@@ -2222,6 +2742,11 @@ int main(int argc, char *argv[]) {
 
   editor_set_status_message(
       "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-N = next | Ctrl-? = help");
+
+  /* Paint the first frame up front. The loop below reads a key before it
+   * paints, so without this the screen stayed blank until the first
+   * keystroke. */
+  editor_refresh_screen();
 
   while (1) {
     editor_process_keypress();

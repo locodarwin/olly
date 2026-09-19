@@ -21,6 +21,12 @@ All this in a single C file with zero external dependencies.
 - **Go to line**: `Ctrl-G` jumps straight to a line number.
 - **Grouped undo/redo**: a run of typed (or deleted) characters, or a
   replace-all, undoes as one step. `Ctrl-Z` undo, `Ctrl-Y` redo.
+- **Selection and clipboard**: hold `Shift` and use the arrows, `Home`/`End`
+  or `PgUp`/`PgDn` to select (the covered text is highlighted in reverse video);
+  `Ctrl-C` copies, `Ctrl-X` cuts and `Ctrl-V` pastes. Typing or deleting over a
+  selection replaces it, and a cut or paste undoes as one step. Copy and cut
+  also place the text on the system clipboard (OSC 52), where the terminal
+  supports it.
 - **Atomic saves**: the file is written to a private temporary file and
   renamed into place, so an interrupted save never leaves it truncated. Line
   endings (`LF` or `CRLF`), a missing final newline, and the file's mode and
@@ -67,10 +73,12 @@ olly new.txt         # open a buffer for a file that doesn't exist yet
 ```
 
 Edit immediately. Every key you type is inserted at the cursor. Save with
-`Ctrl-S`, search with `Ctrl-F`, and keep an eye on the status bar: it shows
-the file name, line count, modified state, and the cursor as
-`Ln <line>, Col <column>`. The display resizes live as you resize the terminal
-window.
+`Ctrl-S`, search with `Ctrl-F`, select with `Shift` + the arrows, and press
+`Ctrl-?` for a key reference. Keep an eye on the status bar: it shows the file
+name, line count, modified state, and the cursor as `Ln <line>, Col <column>`
+(plus a `Sel <bytes>` count while text is selected). The display — including the
+help screen, which reflows between one and two columns — resizes live as you
+resize the terminal window.
 
 ## Keyboard shortcuts
 
@@ -84,13 +92,17 @@ window.
 | `Ctrl-T` | Toggle case-sensitive search |
 | `Ctrl-R` | Search and replace (next or all) |
 | `Ctrl-G` | Go to line |
+| `Ctrl-C` | Copy selection |
+| `Ctrl-X` | Cut selection |
+| `Ctrl-V` | Paste at the cursor |
 | `Ctrl-Z` | Undo |
 | `Ctrl-Y` | Redo |
 | `Ctrl-?` | Help screen |
 | `Ctrl-L` | Repaint |
 | `Esc` | Cancel a prompt |
 | Arrows / `Home` / `End` / `PgUp` / `PgDn` | Move around |
-| `Enter`, `Backspace`, `Delete` | Edit |
+| `Shift` + Arrows / `Home` / `End` / `PgUp` / `PgDn` | Extend selection |
+| `Enter`, `Backspace`, `Delete` | Edit (replaces any selection) |
 
 The full write-up — including the grouped-undo rules, the fallback install
 details, and the file-format notes — is in [`MANUAL.md`](MANUAL.md).

@@ -17,9 +17,11 @@ import time
 def run(argv, keys, rows=24, cols=80, settle=0.4, env=None, status=False):
     """Start argv under a pty, send `keys`, return everything it printed.
 
-    A float in `keys` is treated as a pause in seconds rather than input.
-    With status=True, return (output, wait status) instead. A program still
-    running at the end is killed, so its status reports SIGKILL.
+    A float in `keys` is treated as a pause in seconds rather than input. A
+    (rows, cols) tuple resizes the pty in place -- the kernel then raises
+    SIGWINCH in the child, so a resize can be exercised mid-session. With
+    status=True, return (output, wait status) instead. A program still running
+    at the end is killed, so its status reports SIGKILL.
     """
     pid, fd = pty.fork()
     if pid == 0:
@@ -46,6 +48,14 @@ def run(argv, keys, rows=24, cols=80, settle=0.4, env=None, status=False):
     for key in keys:
         if isinstance(key, float):
             time.sleep(key)
+            continue
+        if isinstance(key, tuple):
+            r, c = key
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", r, c, 0, 0))
+            # olly only notices a SIGWINCH on its ~100ms poll, so give it time
+            # to observe the change and repaint before the next input.
+            time.sleep(0.25)
+            drain(0.15)
             continue
         try:
             os.write(fd, key if isinstance(key, bytes) else key.encode())

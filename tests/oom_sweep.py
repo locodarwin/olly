@@ -26,11 +26,15 @@ from pty_harness import run
 
 ORIGINAL = "alpha\nbeta\ngamma\n"
 DOWN = "\x1b[B"
-# Type, tab, split a line, undo, move, type again, go to a line, replace
-# every match, undo the whole replace-all, save: rows, undo history, the
-# undo-group array, the search/replace prompts, repaints and the save path
-# all allocate along the way.
+SH_RIGHT = "\x1b[1;2C"
+# Type, tab, split a line, undo, move, type again, select+copy, paste,
+# select+cut, paste again (exercising the clipboard and selection-duplication
+# allocations), go to a line, replace every match, undo the whole replace-all,
+# save: rows, undo history, the undo-group array, the clipboard, the
+# search/replace prompts, repaints and the save path all allocate along the way.
 KEYS = ["X", "\t", "\r", "y", "\x1a", DOWN, "z",
+        SH_RIGHT, SH_RIGHT, "\x03", "\x16",
+        SH_RIGHT, SH_RIGHT, "\x18", "\x16",
         "\x07", "2", "\r",
         "\x12", "a", "\r", "b", "\r", "a", "\r",
         "\x1a", "\x13"]
