@@ -1119,10 +1119,19 @@ void editor_insert_newline(void) {
 }
 
 void editor_delete_char(void) {
-  if (E.cy == E.numrows) return;
+  if (E.cy > E.numrows) return;
+  int pre_cx = E.cx, pre_cy = E.cy;
+
+  /* The cursor rests on the phantom row past the last line (where typing
+   * starts a new line): backspace deletes from the end of the real last
+   * line instead. The undo record still restores the phantom position. */
+  if (E.cy == E.numrows) {
+    if (E.numrows == 0) return;
+    E.cy = E.numrows - 1;
+    E.cx = E.row[E.cy].size;
+  }
   if (E.cx == 0 && E.cy == 0) return;
 
-  int pre_cx = E.cx, pre_cy = E.cy;
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
     int at = utf8_prev(row->chars, E.cx);

@@ -180,6 +180,24 @@ def test_keys(tmpdir):
         check(label + " inserts nothing",
               edit(tmpdir, "ab\n", [seq, SAVE]), "ab\n")
 
+    # Regression: the cursor can move down onto the phantom row past the
+    # last line (typing there starts a new line), but Backspace did nothing
+    # at all from that spot.
+    print("\ninput: backspace from the phantom row past the last line")
+    check("deletes the last character of the file",
+          edit(tmpdir, "one\ntwo\n", [DOWN, DOWN, "\x7f", SAVE]), "one\ntw\n")
+    check("works when the file has no trailing newline",
+          edit(tmpdir, "one\ntwo", [DOWN, DOWN, "\x7f", SAVE]), "one\ntw")
+    check("a run of them keeps deleting backwards",
+          edit(tmpdir, "one\ntwo\n", [DOWN, DOWN, "\x7f\x7f", SAVE]), "one\nt\n")
+    check("joins up when the last line is empty",
+          edit(tmpdir, "one\n\n", [DOWN, DOWN, "\x7f", SAVE]), "one\n")
+    check("undo restores what it deleted",
+          edit(tmpdir, "one\ntwo\n", [DOWN, DOWN, "\x7f", UNDO, SAVE]),
+          "one\ntwo\n")
+    check("still does nothing in an empty buffer",
+          edit(tmpdir, "", [DOWN, "\x7f", "X", SAVE]), "X\n")
+
 
 def test_tab(tmpdir):
     print("\ninput: the Tab key types a tab")
