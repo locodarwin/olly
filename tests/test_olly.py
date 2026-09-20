@@ -771,6 +771,74 @@ def test_osc52_clipboard(tmpdir):
           "\x1b[?2004l" in raw("x\n", []), True)
 
 
+# ------------------------------------------------------------- gutter ----
+
+LINENUM = "\x15"  # Ctrl-U toggles the line-number gutter
+
+def test_gutter(tmpdir):
+    print("\ngutter: Ctrl-U shows a right-aligned line-number gutter and "
+          "shifts the text area right by its width")
+
+    def raw(body, keys, name="g.txt", **kw):
+        path = os.path.join(tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(body.encode("utf-8"))
+        return run([OLLY, path], keys, **kw).decode("latin-1")
+
+    # Default off: text starts at screen column 1, no leading number.
+    off = raw("alpha\nbeta\ngamma\n", [])
+    check("off by default (row 1 is the text itself)", "\x1b[1;1Halpha" in off, True)
+    check("off by default (no gutter number)", "\x1b[1;1H1 " in off, False)
+
+    # Toggle on: each row is prefixed by the line number right-aligned to the
+    # digits of the largest line number, plus a separator space.
+    on = raw("alpha\nbeta\ngamma\n", [LINENUM])
+    check("row 1 numbered", "\x1b[1;1H1 alpha" in on, True)
+    check("row 2 numbered", "\x1b[2;1H2 beta" in on, True)
+    check("row 3 numbered", "\x1b[3;1H3 gamma" in on, True)
+
+    # Toggling again reverts: the final paint has text at column 1 again.
+    off2 = raw("alpha\nbeta\ngamma\n", [LINENUM, LINENUM])
+    check("toggle back to off", "\x1b[1;1Halpha" in off2, True)
+
+    # Two-digit line numbers widen the field and stay right-aligned (numrows
+    # 12 -> a 2-digit field). Line 3 is padded with a leading space; line 10 is
+    # not.
+    body12 = "".join("A%02d\n" % i for i in range(1, 13))
+    two = raw(body12, [LINENUM])
+    check("single digit right-aligned in 2-wide field",
+          "\x1b[3;1H 3 A03" in two, True)
+    check("double digit fills the field",
+          "\x1b[10;1H10 A10" in two, True)
+
+    # The cursor is pushed right by exactly the gutter width.
+    a = cursor_col(run([OLLY, _gpath(tmpdir, "hello\n", "c1.txt")], [END]))
+    b = cursor_col(run([OLLY, _gpath(tmpdir, "hello\n", "c2.txt")],
+                       [LINENUM, END]))
+    check("cursor shifted by gutter width", b - a, 2)
+
+    # Wide glyphs still count as two columns *plus* the gutter offset, so the
+    # cursor lands past the full display width and the gutter (not the byte
+    # count) -- the two width adjustments compose.
+    w = cursor_col(run([OLLY, _gpath(tmpdir, "\u3042\u3042\n", "c3.txt")],
+                       [LINENUM, END]))
+    check("gutter + wide-glyph width compose on the cursor", w, 7)
+
+    # A selection highlight composes with the gutter: the number (and its
+    # separator) precede the reverse-video run, which is emitted from the text
+    # columns exactly as when the gutter is off.
+    sel = raw("abcd\n", [LINENUM, SH_RIGHT, SH_RIGHT])
+    check("gutter and selection highlight coexist",
+          "\x1b[1;1H1 \x1b[7mab\x1b[27mcd" in sel, True)
+
+
+def _gpath(tmpdir, body, name):
+    path = os.path.join(tmpdir, name)
+    with open(path, "wb") as fh:
+        fh.write(body.encode("utf-8"))
+    return path
+
+
 # --------------------------------------------------------------- help ----
 
 HELP = "\x1f"  # Ctrl-?
@@ -791,7 +859,7 @@ def test_help(tmpdir):
                   "FIND & REPLACE", "CLIPBOARD", "HISTORY", "VIEW",
                   "Ctrl-S", "Ctrl-Q", "Ctrl-?", "Ctrl-G", "Ctrl-F", "Ctrl-N",
                   "Ctrl-P", "Ctrl-T", "Ctrl-R", "Ctrl-Z", "Ctrl-Y", "Ctrl-C",
-                  "Ctrl-X", "Ctrl-V", "Ctrl-L", "Shift+Arrows", "PgUp/PgDn",
+                  "Ctrl-X", "Ctrl-V", "Ctrl-L", "Ctrl-U", "Shift+Arrows", "PgUp/PgDn",
                   "Home/End", "Bksp/Ctrl-H", "Enter accepts", "Esc cancels"]:
         check("help lists %s" % token, token in wide, True)
 
@@ -933,6 +1001,7 @@ def main():
         test_clipboard(tmpdir)
         test_selection_highlight(tmpdir)
         test_osc52_clipboard(tmpdir)
+        test_gutter(tmpdir)
         test_help(tmpdir)
         test_search(tmpdir)
         test_case_sensitive_search(tmpdir)

@@ -61,6 +61,8 @@ struct editorConfig {
   int clipsize;       /* bytes held in clipboard (not necessarily NUL-terminated) */
   int eol_crlf;       /* write \r\n line endings, as the loaded file used */
   int final_newline;  /* the file ended with a newline (so the save should) */
+  int linenum;        /* line-number gutter shown (Ctrl-U toggles it) */
+  int gutter_w;       /* gutter width in columns for this frame, 0 when off */
   erow *row;
   char *filename;
   char statusmsg[128];
@@ -97,6 +99,13 @@ struct undoState {
 
 static struct editorConfig E;
 static struct undoState U;
+
+/* Width available for text once the line-number gutter takes its columns. The
+ * horizontal scroll, the row draw budget and the cursor column are all measured
+ * against this, not the raw screen width, so the text area simply becomes a
+ * narrower window while the gutter is on and is byte-identical while it is off
+ * (gutter_w is 0). */
+#define TEXT_COLS() (E.screencols - E.gutter_w)
 
 struct abuf {
   char *b;
@@ -1260,7 +1269,7 @@ void editor_scroll(void) {
   if (E.cy < E.rowoff) E.rowoff = E.cy;
   if (E.cy >= E.rowoff + E.screenrows) E.rowoff = E.cy - E.screenrows + 1;
   if (E.rx < E.coloff) E.coloff = E.rx;
-  if (E.rx >= E.coloff + E.screencols) E.coloff = E.rx - E.screencols + 1;
+  if (E.rx >= E.coloff + TEXT_COLS()) E.coloff = E.rx - TEXT_COLS() + 1;
 }
 
 /* --- selection: an anchor (sx,sy) plus the live cursor (cx,cy). Movement with
@@ -1499,6 +1508,29 @@ static void drawbuf_ensure(int n) {
   drawbuf = xrealloc(drawbuf, (size_t)drawbuf_cap);
 }
 
+/* Width of the line-number gutter for this frame: 0 when the toggle is off,
+ * else the digits of the largest line number plus a one-column separator. Sized
+ * from numrows so it stays put while typing and only widens when the buffer
+ * grows past the next power of ten. Collapses to 0 when the window is too
+ * narrow to leave even one text column, so a 3-column terminal never asks the
+ * row renderer to fit text into a non-positive width. */
+static int gutter_width(void) {
+  if (!E.linenum) return 0;
+  int digits = 1, n = E.numrows;
+  while (n >= 10) { n /= 10; digits++; }
+  int w = digits + 1;
+  if (E.screencols - w < 1) return 0;
+  return w;
+}
+
+/* Write the right-aligned gutter field for a text row (the line number padded
+ * to gutter_w-1 columns plus the trailing separator space) into dst, which must
+ * hold gutter_w bytes. dst is left untouched when the gutter is off. */
+static void gutter_number_str(int filerow, char *dst, int gutter_w) {
+  if (gutter_w <= 0) return;
+  snprintf(dst, (size_t)gutter_w + 1, "%*d ", gutter_w - 1, filerow + 1);
+}
+
 /* Draw one text row, honouring display width: horizontal scroll (coloff) and
  * the screen width are measured in columns, so a slice starts and ends on
  * character boundaries. A wide glyph split by either edge is dropped and the
@@ -1538,16 +1570,24 @@ static void editor_draw_text_row(struct abuf *ab, int y, erow *row,
    * a run of zero-width combining marks can consume every column budget-free
    * iteration. */
   int has_sel = (sel1 > sel0);
-  drawbuf_ensure(left_pad + rs * 12 + 16);
+  int gw = E.gutter_w;
+  int text_cols = TEXT_COLS();
+  drawbuf_ensure(gw + left_pad + rs * 12 + 16);
   int p = 0;
-  while (p < left_pad) drawbuf[p++] = ' ';
+  if (gw) {
+    char gnum[24];
+    gutter_number_str(y + E.rowoff, gnum, gw);
+    memcpy(drawbuf + p, gnum, (size_t)gw);
+    p += gw;
+  }
+  while (p < gw + left_pad) drawbuf[p++] = ' ';
 
   int dcol = col;      /* absolute display column of the character at i */
   int vis = left_pad;  /* visible columns emitted so far */
   int in_sel = 0;
-  while (i < rs && vis < E.screencols) {
+  while (i < rs && vis < text_cols) {
     int nb, w = utf8_char_cols(r, rs, i, &nb);
-    if (vis + w > E.screencols) break;  /* would overflow the right edge */
+    if (vis + w > text_cols) break;  /* would overflow the right edge */
     int sel = has_sel && dcol >= sel0 && dcol < sel1;
     if (sel != in_sel) {
       if (sel) { memcpy(drawbuf + p, "\x1b[7m", 4); p += 4; }
@@ -1567,6 +1607,8 @@ static void editor_draw_text_row(struct abuf *ab, int y, erow *row,
 
 void editor_draw_rows(struct abuf *ab) {
   int y;
+  int gw = E.gutter_w;
+  int text_cols = TEXT_COLS();
   for (y = 0; y < E.screenrows; y++) {
     int filerow = y + E.rowoff;
     if (filerow >= E.numrows) {
@@ -1574,10 +1616,10 @@ void editor_draw_rows(struct abuf *ab) {
         char text[96];
         int welcomelen = snprintf(text, sizeof(text),
                                   "Olly editor -- version %s", OLLY_VERSION);
-        if (welcomelen > E.screencols) welcomelen = E.screencols;
-        int pad = (E.screencols - welcomelen) / 2;
+        if (welcomelen > text_cols) welcomelen = text_cols;
+        int pad = (text_cols - welcomelen) / 2;
         if (pad > 0) {
-          int need = pad + welcomelen + 1;
+          int need = gw + pad + welcomelen + 2;
           if (welcome_cap < need) {
             char *nb = realloc(welcome_buf, (size_t)need);
             if (nb == NULL) {
@@ -1589,8 +1631,9 @@ void editor_draw_rows(struct abuf *ab) {
           }
           {
             int n = 0;
+            for (int s = 0; s < gw; s++) welcome_buf[n++] = ' ';
             welcome_buf[n++] = '~';
-            while (n < pad) welcome_buf[n++] = ' ';
+            while (n < gw + 1 + pad) welcome_buf[n++] = ' ';
             memcpy(welcome_buf + n, text, (size_t)welcomelen);
             n += welcomelen;
             cache_line_draw(ab, y, welcome_buf, n, 1);
@@ -1598,6 +1641,12 @@ void editor_draw_rows(struct abuf *ab) {
         } else {
           cache_line_draw(ab, y, text, welcomelen, 1);
         }
+      } else if (gw) {
+        char blank[24];
+        int n = 0;
+        while (n < gw) blank[n++] = ' ';
+        blank[n++] = '~';
+        cache_line_draw(ab, y, blank, n, 0);
       } else {
         cache_line_draw(ab, y, "~", 1, 0);
       }
@@ -1670,6 +1719,7 @@ void editor_refresh_screen(void) {
   E.screenrows = wsrows - 2;
   if (E.screenrows < 1) E.screenrows = 1;
   E.screencols = wscols;
+  E.gutter_w = gutter_width();
   editor_scroll();
 
   struct abuf ab = ABUF_INIT;
@@ -1694,7 +1744,7 @@ void editor_refresh_screen(void) {
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
-      (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1);
+      (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1 + E.gutter_w);
   ab_append(&ab, buf, strlen(buf));
 
   ab_append(&ab, "\x1b[?25h", 6);
@@ -2325,6 +2375,7 @@ static const struct help_item help_items_history[] = {
 };
 static const struct help_item help_items_view[] = {
   {"Ctrl-L", "Redraw screen"},
+  {"Ctrl-U", "Line numbers"},
   {NULL, NULL}
 };
 
@@ -2632,6 +2683,14 @@ void editor_process_keypress(void) {
 
     case CTRL_KEY('l'):
       force_full = 1;
+      break;
+
+    case CTRL_KEY('u'):
+      E.linenum = !E.linenum;
+      /* The gutter widens or shrinks the text area, shifting every column, so
+       * repaint the whole screen rather than trust per-row diffing. */
+      force_full = 1;
+      editor_set_status_message("Line numbers: %s", E.linenum ? "on" : "off");
       break;
 
     case WINCH_KEY:

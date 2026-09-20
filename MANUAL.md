@@ -11,6 +11,8 @@ the arrow keys move around, and the `Ctrl` combinations do the work.
 - [Getting Started](#getting-started)
 - [Editing](#editing)
 - [Moving Around](#moving-around)
+- [Help Screen](#help-screen)
+- [Line Numbers](#line-numbers)
 - [Selecting Text](#selecting-text)
 - [Searching](#searching)
 - [Search and Replace](#search-and-replace)
@@ -88,6 +90,7 @@ end of a line joins the next line onto it.
 | `PgUp` / `PgDn` | Move up / down a screenful |
 | `Ctrl-G` | Go to a line number |
 | `Ctrl-L` | Repaint the screen |
+| `Ctrl-U` | Toggle the line-number gutter |
 
 Hold `Shift` while using the arrows, `Home`/`End`, or `PgUp`/`PgDn` to move the
 cursor and select text along the way — see [Selecting Text](#selecting-text).
@@ -108,6 +111,19 @@ with the arrows, `PgUp`/`PgDn`, `Home`/`End` when the content is taller than the
 screen. Resizing the terminal **while the help screen is open** reflows it live —
 it re-reads the size and switches between the one- and two-column layouts to
 match, without leaving the screen. Press any other key to return to the editor.
+
+## Line Numbers
+
+`Ctrl-U` toggles a line-number gutter (off by default). Each line is prefixed
+with its number, right-aligned in a field as wide as the largest line number in
+the file plus a one-column separator, so the column stays stable while you type
+and only widens when the file crosses the next power of ten.
+
+The gutter is drawn from the text area, not on top of it: showing it narrows the
+usable text width, and the cursor, horizontal scrolling and the wide-character
+alignment all shift to match. Toggling it repaints the whole screen. If the
+window is too narrow to leave even one text column, the gutter is suppressed for
+that frame rather than squeezing the text away.
 
 ## Selecting Text
 
@@ -291,6 +307,7 @@ After saving, the undo history is kept, but the dirty flag is cleared.
     Ctrl-Y   Redo an undone change
     Ctrl-?   Show this help screen
     Ctrl-L   Repaint the screen
+    Ctrl-U   Toggle the line-number gutter
     Shift    Hold with arrows / Home / End / PgUp / PgDn to select
     Esc      Cancel the current prompt
 

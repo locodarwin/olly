@@ -27,6 +27,9 @@ All this in a single C file with zero external dependencies.
   selection replaces it, and a cut or paste undoes as one step. Copy and cut
   also place the text on the system clipboard (OSC 52), where the terminal
   supports it.
+- **Line-number gutter**: `Ctrl-U` toggles a right-aligned line-number gutter
+  (off by default); the text area narrows to make room and the cursor,
+  horizontal scroll and wide-character alignment all follow it.
 - **Atomic saves**: the file is written to a private temporary file and
   renamed into place, so an interrupted save never leaves it truncated. Line
   endings (`LF` or `CRLF`), a missing final newline, and the file's mode and
@@ -99,6 +102,7 @@ resize the terminal window.
 | `Ctrl-Y` | Redo |
 | `Ctrl-?` | Help screen |
 | `Ctrl-L` | Repaint |
+| `Ctrl-U` | Toggle line-number gutter |
 | `Esc` | Cancel a prompt |
 | Arrows / `Home` / `End` / `PgUp` / `PgDn` | Move around |
 | `Shift` + Arrows / `Home` / `End` / `PgUp` / `PgDn` | Extend selection |
