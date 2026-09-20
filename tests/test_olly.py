@@ -775,9 +775,13 @@ def test_osc52_clipboard(tmpdir):
 
 LINENUM = "\x15"  # Ctrl-U toggles the line-number gutter
 
+# The gutter prefix as bytes: SGR-dimmed number, a space, the U+2502 bar and
+# a reset. Output is decoded latin-1, so the bar is its three raw UTF-8 bytes.
+GRAY, SEP, RST = "\x1b[90m", "\xe2\x94\x82", "\x1b[m"
+
 def test_gutter(tmpdir):
-    print("\ngutter: Ctrl-U shows a right-aligned line-number gutter and "
-          "shifts the text area right by its width")
+    print("\ngutter: Ctrl-U shows a right-aligned line-number gutter behind a "
+          "gray separator and shifts the text area right by its width")
 
     def raw(body, keys, name="g.txt", **kw):
         path = os.path.join(tmpdir, name)
@@ -789,13 +793,16 @@ def test_gutter(tmpdir):
     off = raw("alpha\nbeta\ngamma\n", [])
     check("off by default (row 1 is the text itself)", "\x1b[1;1Halpha" in off, True)
     check("off by default (no gutter number)", "\x1b[1;1H1 " in off, False)
+    check("off by default (no separator styling)", GRAY in off, False)
 
     # Toggle on: each row is prefixed by the line number right-aligned to the
-    # digits of the largest line number, plus a separator space.
+    # digits of the largest line number, then " │ ": "1 │ alpha". The whole
+    # gutter is gray and reset before the text.
     on = raw("alpha\nbeta\ngamma\n", [LINENUM])
-    check("row 1 numbered", "\x1b[1;1H1 alpha" in on, True)
-    check("row 2 numbered", "\x1b[2;1H2 beta" in on, True)
-    check("row 3 numbered", "\x1b[3;1H3 gamma" in on, True)
+    pre = GRAY + "%d " + SEP + " " + RST
+    check("row 1 numbered", "\x1b[1;1H" + (pre % 1) + "alpha" in on, True)
+    check("row 2 numbered", "\x1b[2;1H" + (pre % 2) + "beta" in on, True)
+    check("row 3 numbered", "\x1b[3;1H" + (pre % 3) + "gamma" in on, True)
 
     # Toggling again reverts: the final paint has text at column 1 again.
     off2 = raw("alpha\nbeta\ngamma\n", [LINENUM, LINENUM])
@@ -807,29 +814,44 @@ def test_gutter(tmpdir):
     body12 = "".join("A%02d\n" % i for i in range(1, 13))
     two = raw(body12, [LINENUM])
     check("single digit right-aligned in 2-wide field",
-          "\x1b[3;1H 3 A03" in two, True)
+          "\x1b[3;1H" + GRAY + " 3 " + SEP + " " + RST + "A03" in two, True)
     check("double digit fills the field",
-          "\x1b[10;1H10 A10" in two, True)
+          "\x1b[10;1H" + GRAY + "10 " + SEP + " " + RST + "A10" in two, True)
 
-    # The cursor is pushed right by exactly the gutter width.
+    # The separator continues through the blank rows below EOF: a gray blank
+    # field, the bar and the tilde, then reset.
+    tilde = raw("one\n", [LINENUM])
+    check("separator continues through below-EOF rows",
+          "\x1b[2;1H" + GRAY + "  " + SEP + " ~" + RST in tilde, True)
+
+    # ...and through the welcome screen: the separator row carries the tilde
+    # and the centered banner follows in the text area (row 24 - 2 status rows,
+    # screenrows/3 + 1 = 8).
+    wel = raw("", [LINENUM])
+    welrow = wel[wel.rfind("\x1b[8;1H") + len("\x1b[8;1H"):]
+    check("separator continues through the welcome screen",
+          welrow.startswith(GRAY + "  " + SEP + " ~" + RST), True)
+    check("welcome banner follows the separator", "Olly editor" in welrow, True)
+
+    # The cursor is pushed right by exactly the gutter width (digit + " │ ").
     a = cursor_col(run([OLLY, _gpath(tmpdir, "hello\n", "c1.txt")], [END]))
     b = cursor_col(run([OLLY, _gpath(tmpdir, "hello\n", "c2.txt")],
                        [LINENUM, END]))
-    check("cursor shifted by gutter width", b - a, 2)
+    check("cursor shifted by gutter width", b - a, 4)
 
     # Wide glyphs still count as two columns *plus* the gutter offset, so the
     # cursor lands past the full display width and the gutter (not the byte
     # count) -- the two width adjustments compose.
     w = cursor_col(run([OLLY, _gpath(tmpdir, "\u3042\u3042\n", "c3.txt")],
                        [LINENUM, END]))
-    check("gutter + wide-glyph width compose on the cursor", w, 7)
+    check("gutter + wide-glyph width compose on the cursor", w, 9)
 
-    # A selection highlight composes with the gutter: the number (and its
-    # separator) precede the reverse-video run, which is emitted from the text
+    # A selection highlight composes with the gutter: the gray number and its
+    # separator precede the reverse-video run, which is emitted from the text
     # columns exactly as when the gutter is off.
     sel = raw("abcd\n", [LINENUM, SH_RIGHT, SH_RIGHT])
     check("gutter and selection highlight coexist",
-          "\x1b[1;1H1 \x1b[7mab\x1b[27mcd" in sel, True)
+          "\x1b[1;1H" + (pre % 1) + "\x1b[7mab\x1b[27mcd" in sel, True)
 
 
 def _gpath(tmpdir, body, name):

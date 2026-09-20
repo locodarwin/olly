@@ -1509,26 +1509,49 @@ static void drawbuf_ensure(int n) {
 }
 
 /* Width of the line-number gutter for this frame: 0 when the toggle is off,
- * else the digits of the largest line number plus a one-column separator. Sized
- * from numrows so it stays put while typing and only widens when the buffer
- * grows past the next power of ten. Collapses to 0 when the window is too
- * narrow to leave even one text column, so a 3-column terminal never asks the
- * row renderer to fit text into a non-positive width. */
+ * else the digits of the largest line number plus the three-column " │ "
+ * separator ("123 │ text"). Sized from numrows so it stays put while typing
+ * and only widens when the buffer grows past the next power of ten. Collapses
+ * to 0 when the window is too narrow to leave even one text column, so a
+ * 3-column terminal never asks the row renderer to fit text into a
+ * non-positive width. */
 static int gutter_width(void) {
   if (!E.linenum) return 0;
   int digits = 1, n = E.numrows;
   while (n >= 10) { n /= 10; digits++; }
-  int w = digits + 1;
+  int w = digits + 3;
   if (E.screencols - w < 1) return 0;
   return w;
 }
 
-/* Write the right-aligned gutter field for a text row (the line number padded
- * to gutter_w-1 columns plus the trailing separator space) into dst, which must
- * hold gutter_w bytes. dst is left untouched when the gutter is off. */
-static void gutter_number_str(int filerow, char *dst, int gutter_w) {
-  if (gutter_w <= 0) return;
-  snprintf(dst, (size_t)gutter_w + 1, "%*d ", gutter_w - 1, filerow + 1);
+/* The gutter prefix, dimmed gray (SGR 90) and reset at the end so text and
+ * selections keep the terminal default. The escape sequences and the three-
+ * byte UTF-8 U+2502 bar occupy no display columns, so the prefix is wider in
+ * bytes than the gutter_w columns it fills; both builders return the byte
+ * length written (0 when the gutter is off), and the caller tracks byte
+ * offsets with that length rather than with gutter_w. */
+#define GUTTER_GRAY "\x1b[90m"
+#define GUTTER_SEP "\xe2\x94\x82"
+#define GUTTER_RESET "\x1b[m"
+
+/* Text row: the line number right-aligned to gutter_w-3 columns, the " │ "
+ * separator, then the trailing separator space: "123 │ ". dst must hold at
+ * least gutter_w + 11 bytes. */
+static int gutter_number_str(int filerow, char *dst, int gutter_w) {
+  if (gutter_w <= 0) return 0;
+  return snprintf(dst, (size_t)gutter_w + 11,
+                  GUTTER_GRAY "%*d " GUTTER_SEP " " GUTTER_RESET,
+                  gutter_w - 3, filerow + 1);
+}
+
+/* Below-EOF row: a blank number field, the separator and the gray tilde:
+ * "   │ ~", occupying gutter_w + 1 display columns. dst must hold at least
+ * gutter_w + 12 bytes. */
+static int gutter_tilde_str(char *dst, int gutter_w) {
+  if (gutter_w <= 0) return 0;
+  return snprintf(dst, (size_t)gutter_w + 12,
+                  GUTTER_GRAY "%*s " GUTTER_SEP " ~" GUTTER_RESET,
+                  gutter_w - 3, "");
 }
 
 /* Draw one text row, honouring display width: horizontal scroll (coloff) and
@@ -1572,15 +1595,15 @@ static void editor_draw_text_row(struct abuf *ab, int y, erow *row,
   int has_sel = (sel1 > sel0);
   int gw = E.gutter_w;
   int text_cols = TEXT_COLS();
-  drawbuf_ensure(gw + left_pad + rs * 12 + 16);
+  char gnum[32];
+  int gbytes = gutter_number_str(y + E.rowoff, gnum, gw);
+  drawbuf_ensure(gbytes + left_pad + rs * 12 + 16);
   int p = 0;
-  if (gw) {
-    char gnum[24];
-    gutter_number_str(y + E.rowoff, gnum, gw);
-    memcpy(drawbuf + p, gnum, (size_t)gw);
-    p += gw;
+  if (gbytes) {
+    memcpy(drawbuf + p, gnum, (size_t)gbytes);
+    p += gbytes;
   }
-  while (p < gw + left_pad) drawbuf[p++] = ' ';
+  while (p < gbytes + left_pad) drawbuf[p++] = ' ';
 
   int dcol = col;      /* absolute display column of the character at i */
   int vis = left_pad;  /* visible columns emitted so far */
@@ -1619,7 +1642,7 @@ void editor_draw_rows(struct abuf *ab) {
         if (welcomelen > text_cols) welcomelen = text_cols;
         int pad = (text_cols - welcomelen) / 2;
         if (pad > 0) {
-          int need = gw + pad + welcomelen + 2;
+          int need = gw + pad + welcomelen + 14;
           if (welcome_cap < need) {
             char *nb = realloc(welcome_buf, (size_t)need);
             if (nb == NULL) {
@@ -1630,10 +1653,15 @@ void editor_draw_rows(struct abuf *ab) {
             welcome_cap = need;
           }
           {
-            int n = 0;
-            for (int s = 0; s < gw; s++) welcome_buf[n++] = ' ';
-            welcome_buf[n++] = '~';
-            while (n < gw + 1 + pad) welcome_buf[n++] = ' ';
+            int n;
+            if (gw) {
+              n = gutter_tilde_str(welcome_buf, gw);
+            } else {
+              welcome_buf[0] = '~';
+              n = 1;
+            }
+            int base = n;  /* bytes of prefix; the pad follows in columns */
+            while (n < base + pad) welcome_buf[n++] = ' ';
             memcpy(welcome_buf + n, text, (size_t)welcomelen);
             n += welcomelen;
             cache_line_draw(ab, y, welcome_buf, n, 1);
@@ -1642,10 +1670,8 @@ void editor_draw_rows(struct abuf *ab) {
           cache_line_draw(ab, y, text, welcomelen, 1);
         }
       } else if (gw) {
-        char blank[24];
-        int n = 0;
-        while (n < gw) blank[n++] = ' ';
-        blank[n++] = '~';
+        char blank[32];
+        int n = gutter_tilde_str(blank, gw);
         cache_line_draw(ab, y, blank, n, 0);
       } else {
         cache_line_draw(ab, y, "~", 1, 0);
