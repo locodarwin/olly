@@ -1853,13 +1853,23 @@ static int render_match(const char *hay, const char *needle, int n) {
                                 : strncasecmp(hay, needle, (size_t)n) == 0;
 }
 
+/* How far the sweep may run before giving up. */
+enum search_sweep {
+  SEARCH_WRAP,      /* full circle, starting row revisited from its start */
+  SEARCH_ONE_PASS,  /* every row once, the starting row only from the cursor */
+  SEARCH_NO_WRAP    /* from the cursor to the last row only, never backward */
+};
+
 /* dir = 1 search forward, -1 search backward. exclude_current causes the
- * search to skip a match exactly at the cursor. nowrap stops the sweep
- * after one pass over every row instead of wrapping back to revisit the
- * starting row -- used by replace-all, which must terminate even when the
- * replacement text itself contains the search term. */
+ * search to skip a match exactly at the cursor. The sweep mode decides the
+ * reach: SEARCH_WRAP wraps (plain find, so a term before the cursor is
+ * reachable), SEARCH_ONE_PASS visits each row once, and SEARCH_NO_WRAP
+ * never moves past the cursor toward the start of the file -- replace-all
+ * needs that stronger guarantee: with a weaker sweep the wrap can revisit
+ * an earlier row from column 0 and re-match a replacement that contains
+ * the search term, looping forever as the row grows without bound. */
 static int editor_search_string(const char *query, int qlen, int dir,
-    int exclude_current, int nowrap) {
+    int exclude_current, enum search_sweep sweep) {
   int saved_cx = E.cx;
   int saved_cy = E.cy;
   int saved_coloff = E.coloff;
@@ -1875,12 +1885,19 @@ static int editor_search_string(const char *query, int qlen, int dir,
    * scans, and the cursor's display column (E.rx) is no longer the same thing
    * once a line holds wide or combining characters. */
   int cur_rb = editor_row_cx_to_rbyte(&E.row[cur], E.cx);
-  /* k runs to n inclusive, so the starting row is visited a second time at
-   * the end of the wrap. Only then is it scanned from its beginning, which
-   * is what makes a match earlier on the cursor's own line reachable.
-   * nowrap drops that extra pass, so the sweep visits each row exactly
-   * once and always terminates. */
-  int kmax = nowrap ? n - 1 : n;
+  /* SEARCH_WRAP runs k to n inclusive, so the starting row is visited a
+   * second time at the end of the wrap. Only then is it scanned from its
+   * beginning, which is what makes a match earlier on the cursor's own row
+   * reachable. SEARCH_ONE_PASS drops that extra pass, and SEARCH_NO_WRAP
+   * additionally stops the sweep at the end of the file (or at row 0 when
+   * searching backward), so no row behind the cursor is ever scanned. */
+  int kmax;
+  if (sweep == SEARCH_NO_WRAP)
+    kmax = dir > 0 ? n - 1 - cur : cur;
+  else if (sweep == SEARCH_ONE_PASS)
+    kmax = n - 1;
+  else
+    kmax = n;
   for (k = 0; k <= kmax; k++) {
     int i = dir > 0 ? (cur + k) % n : ((cur - k) % n + n) % n;
     erow *row = &E.row[i];
@@ -1932,7 +1949,7 @@ void editor_find(void) {
 
   const char *term = query[0] != '\0' ? query : last_query;
   int excl = (query[0] == '\0');
-  if (editor_search_string(term, strlen(term), 1, excl, 0))
+  if (editor_search_string(term, strlen(term), 1, excl, SEARCH_WRAP))
     editor_set_status_message("Found");
   else
     editor_set_status_message("Not found. Press Ctrl-N to search again");
@@ -1944,7 +1961,7 @@ void editor_find_next(void) {
     editor_set_status_message("No previous search. Press Ctrl-F to search");
     return;
   }
-  if (editor_search_string(last_query, strlen(last_query), 1, 1, 0))
+  if (editor_search_string(last_query, strlen(last_query), 1, 1, SEARCH_WRAP))
     editor_set_status_message("Found (next)");
   else
     editor_set_status_message("Not found. Press Ctrl-P to search backward");
@@ -1955,7 +1972,7 @@ void editor_find_prev(void) {
     editor_set_status_message("No previous search. Press Ctrl-F to search");
     return;
   }
-  if (editor_search_string(last_query, strlen(last_query), -1, 1, 0))
+  if (editor_search_string(last_query, strlen(last_query), -1, 1, SEARCH_WRAP))
     editor_set_status_message("Found (previous)");
   else
     editor_set_status_message("Not found. Press Ctrl-N to search forward");
@@ -2033,13 +2050,15 @@ void editor_replace(void) {
     E.cx = 0;
   }
 
-  /* nowrap=1: without it a replace-all whose replacement text contains the
-   * search term would find its own output forever. Positioning the cursor
-   * just past each replacement before the next search call means the just
-   * -inserted text is always behind the new starting point, so it can
-   * never be matched again even without the nowrap guard -- but nowrap is
-   * kept too, since it is what makes the sweep provably finite regardless. */
-  while (editor_search_string(query, qlen, 1, 0, 1)) {
+  /* replace-all sweeps with SEARCH_NO_WRAP: the cursor only ever moves
+   * forward and the scan restarts strictly behind it, so the replacement
+   * text -- even when it contains the search term -- can never be matched
+   * again, and with only finitely many rows ahead of the cursor the loop
+   * provably terminates. The cursor reset to (0, 0) above makes that
+   * forward-only sweep cover the whole file. replace-next keeps the
+   * one-pass wrap, so it reaches matches on the rows before the cursor. */
+  const enum search_sweep sweep = all ? SEARCH_NO_WRAP : SEARCH_ONE_PASS;
+  while (editor_search_string(query, qlen, 1, 0, sweep)) {
     if (!grouped) {
       undo_group_begin();
       grouped = 1;

@@ -336,6 +336,26 @@ def test_replace(tmpdir):
           edit(tmpdir, "a a a\n",
                [REPLACE, "a", "\r", "aa", "\r", "a", "\r", SAVE]),
           "aa aa aa\n")
+    # Regression: that guard only covered the cursor's own row -- the sweep
+    # still wrapped around to earlier rows and rescanned them from column 0,
+    # so on a multi-row file a replacement containing the search term was
+    # re-matched forever (100% CPU, unbounded memory until the OOM killer).
+    check("a replacement containing the search term terminates across rows",
+          edit(tmpdir, "a\na\n",
+               [REPLACE, "a", "\r", "ba", "\r", "a", "\r", SAVE]), "ba\nba\n")
+    check("an identity replace-all of every match terminates",
+          edit(tmpdir, "ab\nba\n",
+               [REPLACE, "a", "\r", "a", "\r", "a", "\r", SAVE]), "ab\nba\n")
+    check("one undo restores a self-referential multi-row replace-all",
+          edit(tmpdir, "a\na\n",
+               [REPLACE, "a", "\r", "ba", "\r", "a", "\r", UNDO, SAVE]),
+          "a\na\n")
+    # Replace-next must keep wrapping: it reaches matches on rows before
+    # the cursor (the forward-only sweep is replace-all's, not its own).
+    check("replace-next still wraps to earlier rows",
+          edit(tmpdir, "a\nb\n",
+               [DOWN, REPLACE, "a", "\r", "Q", "\r", "n", "\r", SAVE]),
+          "Q\nb\n")
 
     print("\nreplace: a match spanning a tab-expanded region deletes the "
           "right bytes")
