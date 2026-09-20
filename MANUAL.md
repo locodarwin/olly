@@ -116,8 +116,11 @@ match, without leaving the screen. Press any other key to return to the editor.
 
 `Ctrl-U` toggles a line-number gutter (off by default). Each line is prefixed
 with its number, right-aligned in a field as wide as the largest line number in
-the file plus a one-column separator, so the column stays stable while you type
-and only widens when the file crosses the next power of ten.
+the file, followed by a gray vertical separator: `123 │ text`. The field width
+is that number's digits plus the separator, so the column stays stable while
+you type and only widens when the file crosses the next power of ten. The
+separator is a continuous gray line: it runs through every row, including the
+blank `~` rows below the end of the file and the welcome screen.
 
 The gutter is drawn from the text area, not on top of it: showing it narrows the
 usable text width, and the cursor, horizontal scrolling and the wide-character

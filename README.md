@@ -28,8 +28,9 @@ All this in a single C file with zero external dependencies.
   also place the text on the system clipboard (OSC 52), where the terminal
   supports it.
 - **Line-number gutter**: `Ctrl-U` toggles a right-aligned line-number gutter
-  (off by default); the text area narrows to make room and the cursor,
-  horizontal scroll and wide-character alignment all follow it.
+  behind a gray `│` separator (off by default); the text area narrows to make
+  room and the cursor, horizontal scroll and wide-character alignment all
+  follow it.
 - **Atomic saves**: the file is written to a private temporary file and
   renamed into place, so an interrupted save never leaves it truncated. Line
   endings (`LF` or `CRLF`), a missing final newline, and the file's mode and
