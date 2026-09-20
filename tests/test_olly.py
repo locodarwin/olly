@@ -793,7 +793,13 @@ def test_gutter(tmpdir):
     off = raw("alpha\nbeta\ngamma\n", [])
     check("off by default (row 1 is the text itself)", "\x1b[1;1Halpha" in off, True)
     check("off by default (no gutter number)", "\x1b[1;1H1 " in off, False)
-    check("off by default (no separator styling)", GRAY in off, False)
+    check("off by default (no gutter separator)", SEP in off, False)
+
+    # The below-EOF tilde is tinted gray even with the gutter off, matching
+    # the tilde drawn inside the gutter.
+    off_t = raw("one\n", [])
+    check("tilde is gray in no-gutter mode",
+          "\x1b[2;1H" + GRAY + "~" + RST in off_t, True)
 
     # Toggle on: each row is prefixed by the line number right-aligned to the
     # digits of the largest line number, then " │ ": "1 │ alpha". The whole

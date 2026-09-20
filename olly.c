@@ -1657,8 +1657,8 @@ void editor_draw_rows(struct abuf *ab) {
             if (gw) {
               n = gutter_tilde_str(welcome_buf, gw);
             } else {
-              welcome_buf[0] = '~';
-              n = 1;
+              memcpy(welcome_buf, GUTTER_GRAY "~" GUTTER_RESET, 9);
+              n = 9;
             }
             int base = n;  /* bytes of prefix; the pad follows in columns */
             while (n < base + pad) welcome_buf[n++] = ' ';
@@ -1674,7 +1674,7 @@ void editor_draw_rows(struct abuf *ab) {
         int n = gutter_tilde_str(blank, gw);
         cache_line_draw(ab, y, blank, n, 0);
       } else {
-        cache_line_draw(ab, y, "~", 1, 0);
+        cache_line_draw(ab, y, GUTTER_GRAY "~" GUTTER_RESET, 9, 0);
       }
     } else {
       int s0, s1;
