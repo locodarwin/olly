@@ -1,0 +1,17 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      # pty-driven regression suite plus the differential replace-all fuzz.
+      - run: make test
+      # Allocation-failure sweep: every allocation failed in turn, the
+      # editor must survive or exit through die().
+      - run: make test-oom

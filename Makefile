@@ -30,6 +30,7 @@ uninstall:
 
 test: olly
 	python3 tests/test_olly.py ./olly
+	python3 tests/fuzz_replace.py ./olly
 
 test-oom: olly
 	python3 tests/oom_sweep.py ./olly

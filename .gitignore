@@ -2,5 +2,7 @@ olly
 *.o
 olly_asan
 olly_vuln
+*.olly-recover
+olly-recover.*
 __pycache__/
 .claude/
