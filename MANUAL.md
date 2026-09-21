@@ -190,7 +190,11 @@ search, Olly tells you and asks you to press `Ctrl-F` again.
 Matching is case-insensitive by default. `Ctrl-T` toggles case-sensitive
 matching on or off at any time (not just while a search prompt is open); the
 status bar reports which mode is now active. The setting applies to `Ctrl-F`,
-`Ctrl-N`, `Ctrl-P`, and search-and-replace alike.
+`Ctrl-N`, `Ctrl-P`, and search-and-replace alike. The case-insensitive fold
+covers ASCII `a`-`z` only — every other byte is compared as-is, so accented
+letters match only themselves. A match always spans whole characters: a
+query that would begin or end inside a UTF-8 character never matches, which
+also guarantees a replace can never splice a character in half.
 
 ## Search and Replace
 
@@ -216,6 +220,13 @@ was. Replacement respects the current case-sensitivity setting (`Ctrl-T`).
 Consecutive typing of characters (and consecutive partial deletions) are
 grouped into a single change, so undoing a whole typed word is one press.
 Undoing a change puts it back onto the redo stack, so `Ctrl-Y` replays it.
+
+The history is bounded: once a stack holds more than 32,768 entries or
+16 MB of stored text, Olly forgets its oldest entries. A long session can
+therefore only limit how far back `Ctrl-Z` reaches — it can never exhaust
+memory on history alone. (The step limit can be lowered through the
+`OLLY_UNDO_STEPS` environment variable, which is how the test suite
+exercises the eviction.)
 
 Changes are aggregated this way:
 

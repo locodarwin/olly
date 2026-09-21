@@ -90,8 +90,10 @@ struct uchange {
 struct undoState {
   struct uchange **undo;
   int undo_n, undo_cap;
+  size_t undo_bytes;    /* retained payload, drives the cap */
   struct uchange **redo;
   int redo_n, redo_cap;
+  size_t redo_bytes;
   int locked;
   int active_group;  /* group id new uchanges are stamped with, 0 = none */
   int group_seq;      /* last group id issued */
@@ -815,12 +817,26 @@ struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) 
   return u;
 }
 
+/* --- history caps ----------------------------------------------------------
+ * Both stacks evict their oldest entries past the caps, so an editing bug
+ * (or a pathological session) that pushes forever can degrade undo depth
+ * but never consume unbounded memory. The step cap can be lowered through
+ * OLLY_UNDO_STEPS for testing. */
+#define UNDO_MAX_STEPS 32768
+#define UNDO_MAX_BYTES (16 * 1024 * 1024)
+static int undo_max_steps = UNDO_MAX_STEPS;
+
+static void undo_stack_trim(struct uchange **s, int *n, size_t *bytes);
+void uc_free(struct uchange *u);
+
 void undo_push(struct uchange *u) {
   if (U.undo_n == U.undo_cap) {
     U.undo_cap = U.undo_cap ? U.undo_cap * 2 : 32;
     U.undo = xrealloc(U.undo, sizeof(struct uchange *) * (size_t)U.undo_cap);
   }
   U.undo[U.undo_n++] = u;
+  U.undo_bytes += u->len + sizeof(struct uchange);
+  undo_stack_trim(U.undo, &U.undo_n, &U.undo_bytes);
 }
 
 void redo_push(struct uchange *u) {
@@ -829,6 +845,8 @@ void redo_push(struct uchange *u) {
     U.redo = xrealloc(U.redo, sizeof(struct uchange *) * (size_t)U.redo_cap);
   }
   U.redo[U.redo_n++] = u;
+  U.redo_bytes += u->len + sizeof(struct uchange);
+  undo_stack_trim(U.redo, &U.redo_n, &U.redo_bytes);
 }
 
 void clear_redo(void) {
@@ -838,6 +856,7 @@ void clear_redo(void) {
     free(U.redo[i]);
   }
   U.redo_n = 0;
+  U.redo_bytes = 0;
 }
 
 /* Multi-edit operations (replace-all) push several uchanges that must undo
@@ -878,14 +897,29 @@ void editor_free_undo_redo(void) {
   U.redo = NULL;
   U.undo_n = 0;
   U.undo_cap = 0;
+  U.undo_bytes = 0;
   U.redo_n = 0;
   U.redo_cap = 0;
+  U.redo_bytes = 0;
   U.locked = 0;
 }
 
 void uc_free(struct uchange *u) {
   free(u->text);
   free(u);
+}
+
+/* Evict oldest entries until both caps hold again. Dropping the bottom of
+ * the stack can only truncate the oldest undo step (possibly the tail of a
+ * group); the group walk on undo already stops at the stack bottom, so a
+ * truncated group simply undoes fewer changes and stays consistent. */
+static void undo_stack_trim(struct uchange **s, int *n, size_t *bytes) {
+  while (*n > 1 && (*n > undo_max_steps || *bytes > UNDO_MAX_BYTES)) {
+    *bytes -= s[0]->len + sizeof(struct uchange);
+    uc_free(s[0]);
+    memmove(s, s + 1, sizeof(struct uchange *) * (size_t)(*n - 1));
+    (*n)--;
+  }
 }
 
 void uc_do_insert(struct uchange *u) {
@@ -1073,6 +1107,7 @@ void editor_insert_char(int c) {
     top->text = xrealloc(top->text, top->len + 2);
     top->text[top->len++] = c;
     top->text[top->len] = '\0';
+    U.undo_bytes++;
     top->cx1 = E.cx;
     top->cy1 = E.cy;
   } else {
@@ -1149,6 +1184,7 @@ void editor_delete_char(void) {
       free(top->text);
       top->text = nt;
       top->len++;
+      U.undo_bytes++;
       top->at--;
       top->cx1 = at;
       top->cy1 = E.cy;
@@ -1198,6 +1234,7 @@ void editor_del_char(void) {
       top->text[l] = row->chars[at];
       top->text[l + 1] = '\0';
       top->len++;
+      U.undo_bytes++;
       top->cx1 = E.cx;
       top->cy1 = E.cy;
     } else {
@@ -1848,9 +1885,37 @@ static void editor_set_last_query(const char *q) {
   last_query = q ? xstrdup(q) : NULL;
 }
 
+/* Explicit ASCII case folding. Deliberately not strncasecmp: that folds
+ * according to the current locale, so the same query would match differently
+ * under, say, a Turkish locale, and it folds non-ASCII bytes in ways Olly
+ * does not control. Olly compares raw bytes everywhere else, so the case
+ * insensitive fold folds exactly A-Z/a-z and compares every other byte
+ * as-is; non-ASCII letters are never case-folded. */
+static int ascii_fold(unsigned char c) {
+  return (c >= 'a' && c <= 'z') ? (unsigned char)(c - ('a' - 'A')) : c;
+}
+
 static int render_match(const char *hay, const char *needle, int n) {
-  return search_case_sensitive ? strncmp(hay, needle, (size_t)n) == 0
-                                : strncasecmp(hay, needle, (size_t)n) == 0;
+  int i;
+
+  if (search_case_sensitive)
+    return strncmp(hay, needle, (size_t)n) == 0;
+  for (i = 0; i < n; i++)
+    if (ascii_fold((unsigned char)hay[i]) !=
+        ascii_fold((unsigned char)needle[i]))
+      return 0;
+  return 1;
+}
+
+/* A match is only accepted when it spans whole characters: its first byte
+ * must not be a UTF-8 continuation byte (otherwise the cursor would land
+ * inside a character), and the byte just past it must not be one either
+ * (otherwise the match ends mid-character and a replace would splice a
+ * character in half). render is NUL-terminated, so hay[n] is in bounds and
+ * reads as a non-continuation byte at end of row. */
+static int match_is_char_aligned(const char *hay, int n) {
+  return !utf8_is_cont((unsigned char)hay[0]) &&
+         !utf8_is_cont((unsigned char)hay[n]);
 }
 
 /* How far the sweep may run before giving up. */
@@ -1881,9 +1946,9 @@ static int editor_search_string(const char *query, int qlen, int dir,
   /* The cursor may sit on the phantom line past the last row; anchor the
    * sweep to a real row in that case. */
   int cur = (E.cy >= n) ? 0 : E.cy;
-  /* The cursor's position as a render byte offset -- render is what strncasecmp
-   * scans, and the cursor's display column (E.rx) is no longer the same thing
-   * once a line holds wide or combining characters. */
+  /* The cursor's position as a render byte offset -- render is what the
+   * search scans, and the cursor's display column (E.rx) is no longer the
+   * same thing once a line holds wide or combining characters. */
   int cur_rb = editor_row_cx_to_rbyte(&E.row[cur], E.cx);
   /* SEARCH_WRAP runs k to n inclusive, so the starting row is visited a
    * second time at the end of the wrap. Only then is it scanned from its
@@ -1907,7 +1972,8 @@ static int editor_search_string(const char *query, int qlen, int dir,
       int start = on_start_row ? (exclude_current ? cur_rb + 1 : cur_rb) : 0;
       int col;
       for (col = start; col <= maxstart; col++) {
-        if (render_match(row->render + col, query, qlen)) {
+        if (render_match(row->render + col, query, qlen) &&
+            match_is_char_aligned(row->render + col, qlen)) {
           E.cy = i;
           E.cx = editor_render_byte_to_cx(row, col);
           return 1;
@@ -1919,7 +1985,8 @@ static int editor_search_string(const char *query, int qlen, int dir,
       if (start > maxstart) start = maxstart;
       int col;
       for (col = start; col >= 0; col--) {
-        if (render_match(row->render + col, query, qlen)) {
+        if (render_match(row->render + col, query, qlen) &&
+            match_is_char_aligned(row->render + col, qlen)) {
           E.cy = i;
           E.cx = editor_render_byte_to_cx(row, col);
           return 1;
@@ -2837,6 +2904,16 @@ void init_editor(void) {
   E.eol_crlf = 0;
   E.final_newline = 1;
   build_recovery_path();
+
+  /* Test hook (documented in MANUAL.md): shrink the undo cap so history
+   * eviction is reachable without editing for an hour. */
+  {
+    const char *cap = getenv("OLLY_UNDO_STEPS");
+    if (cap && *cap) {
+      long v = strtol(cap, NULL, 10);
+      if (v > 0) undo_max_steps = (v > 1000000000L) ? 1000000000 : (int)v;
+    }
+  }
 
   if (get_window_size(&E.screenrows, &E.screencols) == -1)
     die("get_window_size");

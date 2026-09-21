@@ -268,6 +268,39 @@ def test_case_sensitive_search(tmpdir):
           True)
 
 
+def test_char_aligned_search(tmpdir):
+    print("\nsearch: a match may only span whole characters")
+    path = os.path.join(tmpdir, "u8.txt")
+
+    def find(body, keys):
+        with open(path, "wb") as fh:
+            fh.write(body)
+        return (status_lines(run([OLLY, path], keys)) or [""])[-1]
+
+    # Regression: search compared raw bytes, so a query made of UTF-8
+    # continuation or lead bytes could match inside a multibyte character
+    # and park the cursor (or cut a replace) in the middle of it.
+    check("a query equal to a continuation byte finds nothing",
+          find(b"caf\xc3\xa9\n", ["\x06", b"\xa9", "\r"]).startswith("Not found"),
+          True)
+    check("a query that ends mid-character finds nothing",
+          find(b"a\xc3\xa9b\n", ["\x06", b"a\xc3", "\r"]).startswith("Not found"),
+          True)
+    check("a query that starts mid-character finds nothing",
+          find(b"a\xc3\xa9b\n", ["\x06", b"\xa9b", "\r"]).startswith("Not found"),
+          True)
+    check("a whole multibyte character still matches",
+          find(b"caf\xc3\xa9\n", ["\x06", b"\xc3\xa9", "\r"]).startswith("Found"),
+          True)
+    check("case folding covers ASCII letters only, never raw bytes",
+          find(b"caf\xc3\xa9\n", ["\x06", b"CAF\xc3\x89", "\r"])
+              .startswith("Not found"),
+          True)
+    check("ASCII case-insensitive matching is unaffected",
+          find(b"ALPHA caf\xc3\xa9\n", ["\x06", "alpha", "\r"]).startswith("Found"),
+          True)
+
+
 # --------------------------------------------------------------- goto ----
 
 def test_goto_line(tmpdir):
@@ -1050,6 +1083,30 @@ def test_undo(tmpdir):
               original)
 
 
+def test_undo_cap(tmpdir):
+    print("\nundo: history evicts its oldest steps past the cap")
+    path = os.path.join(tmpdir, "cap.txt")
+    once = [REPLACE, "x", "\r", "Q", "\r", "n", "\r"]
+
+    def play(keys, env=None):
+        with open(path, "wb") as fh:
+            fh.write(b"x x x\n")
+        run([OLLY, path], keys, env=env)
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    # Each replace-next stores two entries, so OLLY_UNDO_STEPS=2 keeps only
+    # the last replacement. Reaching past the cap reports exhaustion instead
+    # of undoing, and everything the cap evicted stays applied.
+    capped = {"OLLY_UNDO_STEPS": "2"}
+    check("capped history undoes only the kept steps",
+          play(once * 3 + [UNDO, UNDO, SAVE], capped), b"Q Q x\n")
+    check("undoing past the cap reports nothing left",
+          play(once * 3 + [UNDO, UNDO, UNDO, SAVE], capped), b"Q Q x\n")
+    check("uncapped, the same session undoes every step",
+          play(once * 3 + [UNDO, UNDO, UNDO, SAVE]), b"x x x\n")
+
+
 def main():
     global OLLY
     OLLY = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "./olly")
@@ -1071,6 +1128,7 @@ def main():
         test_help(tmpdir)
         test_search(tmpdir)
         test_case_sensitive_search(tmpdir)
+        test_char_aligned_search(tmpdir)
         test_goto_line(tmpdir)
         test_replace(tmpdir)
         test_save(tmpdir)
@@ -1081,6 +1139,7 @@ def main():
         test_recovery(tmpdir)
         test_directory_refused(tmpdir)
         test_undo(tmpdir)
+        test_undo_cap(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
