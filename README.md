@@ -114,6 +114,42 @@ resize the terminal window.
 The full write-up — including the grouped-undo rules, the fallback install
 details, and the file-format notes — is in [`MANUAL.md`](MANUAL.md).
 
+## Design & limitations
+
+Olly's constraints are design choices: one C file, no external dependencies,
+no config file, no state directories, and modeless editing. Everything Olly
+does should be discoverable from within the editor and readable in that one
+file.
+
+There is therefore a list of things Olly deliberately does not do — not
+because they are hard, but because each would cost the single file, the zero
+dependencies, or the modelessness that define it:
+
+- **No regex.** Search and replace take literal strings. Regex would mean a
+  matching engine, as a dependency or as a second thousand-line program.
+- **No indentation settings.** `Tab` inserts a tab character, displayed at
+  eight-column tab stops; there is no setting to convert it to spaces, no
+  per-file indent rules, no auto-indent.
+- **No splits, buffer lists, or multi-cursor.** One terminal, one file, one
+  cursor. Olly starts instantly, so run as many instances as you like.
+- **No configuration file, themes, or plugins.** Olly behaves the same on
+  every machine, which is rather the point.
+- **No modal editing.** Nothing to learn, and no way to lose work by
+  forgetting which mode you are in.
+
+A few limits are practical rather than philosophical:
+
+- Case-insensitive search and case toggling fold ASCII letters (`a`–`z`)
+  only; other bytes are compared exactly, so results never depend on the
+  machine's locale.
+- Undo history is bounded at 32,768 steps or 16 MB of stored text, oldest
+  first.
+- One file per invocation; further file arguments are reported and ignored.
+
+A feature request that lands on the will-not-do list above is not a bug
+report waiting to happen — it is a sign Olly is not the right tool for that
+job, and there are excellent editors that are.
+
 ## Acknowledgements
 
 Olly builds on the architecture of the classic [kilo] editor by antirez;
