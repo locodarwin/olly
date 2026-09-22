@@ -1054,6 +1054,72 @@ def test_recovery(tmpdir):
           os.path.exists(rec), False)
 
 
+def test_recovery_prompt(tmpdir):
+    print("\nrecovery: startup offers to restore data left by a crash")
+    path = os.path.join(tmpdir, "doc.txt")
+    rec = path + ".olly-recover"
+
+    def setup():
+        with open(path, "w") as fh:
+            fh.write("on disk\n")
+        with open(rec, "w") as fh:
+            fh.write("rescued\n")
+
+    setup()
+    out, _ = run([OLLY, path], [], status=True)
+    check("a leftover recovery file triggers a restore prompt",
+          any("R = restore" in m for m in status_lines(out)), True)
+    check("the recovered data is visible to no keystroke yet",
+          b"rescued" in out, False)
+
+    os.remove(rec)
+    out, _ = run([OLLY, path], [], status=True)
+    check("no prompt when there is no recovery file",
+          any("restore" in m for m in status_lines(out)), False)
+    setup()
+
+    # Any other key continues with the on-disk file; the recovery file then
+    # disappears on quit exactly as it always did.
+    out = run([OLLY, path], [DOWN, "\x11"])
+    check("dismissing the prompt keeps the on-disk buffer",
+          b"on disk" in out, True)
+    check("a dismissed recovery file is removed on quit",
+          os.path.exists(rec), False)
+
+    setup()
+    out = run([OLLY, path], ["r", SAVE, "\x11"])
+    with open(path) as fh:
+        body = fh.read()
+    check("R loads the recovered data and Ctrl-S saves it",
+          body, "rescued\n")
+    check("saving after a restore removes the recovery file",
+          os.path.exists(rec), False)
+    check("the restore announces itself in the status bar",
+          any("Restored unsaved changes" in m for m in status_lines(out)),
+          True)
+
+    setup()
+    out = run([OLLY, path], ["r", "\x11"])
+    check("a restored buffer counts as unsaved work (quit warns)",
+          any("unsaved" in m.lower() for m in status_lines(out)), True)
+
+    setup()
+    run([OLLY, path], ["r", "\x11", "\x11", "\x11", "\x11"])
+    check("quitting a restored buffer without saving cleans up anyway",
+          os.path.exists(rec), False)
+
+    # The on-disk file having vanished since the crash must not stop the
+    # restore: the recovery data is all that is left of it.
+    os.remove(path)
+    with open(rec, "w") as fh:
+        fh.write("rescued\n")
+    run([OLLY, path], ["r", SAVE, "\x11"])
+    with open(path) as fh:
+        body = fh.read()
+    check("restore recreates a file that no longer exists",
+          body, "rescued\n")
+
+
 # --------------------------------------------------------- robustness ----
 
 def test_directory_refused(tmpdir):
@@ -1137,6 +1203,7 @@ def main():
         test_symlink_race(tmpdir)
         test_signals(tmpdir)
         test_recovery(tmpdir)
+        test_recovery_prompt(tmpdir)
         test_directory_refused(tmpdir)
         test_undo(tmpdir)
         test_undo_cap(tmpdir)

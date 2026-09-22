@@ -2386,18 +2386,10 @@ void editor_save(void) {
   if (recovery_path[0] != '\0') unlink(recovery_path);
 }
 
-void editor_open(char *filename) {
-  free(E.filename);
-  E.filename = xstrdup(filename);
-  build_recovery_path();
-  have_disk_mtime = 0;
-
-  FILE *fp = fopen(filename, "r");
-  if (!fp) {
-    if (errno == ENOENT) return;
-    die("fopen");
-  }
-
+/* Read every line of fp into the (already empty) buffer and set the end-of-
+ * line style flags from what was seen. Returns -1 if the stream ended in a
+ * read error rather than at end of file. */
+int editor_fill_rows(FILE *fp) {
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
@@ -2418,17 +2410,32 @@ void editor_open(char *filename) {
     if (linelen > INT_MAX - 1) die("line too long");
     editor_insert_row(E.numrows, line, (size_t)linelen);
   }
+  free(line);
   /* getline returns -1 for a read error as well as at end of file. Taking an
    * error for the end would present a partial buffer as the whole file, and
-   * the next save would truncate the file on disk. This also refuses a
-   * directory, which used to open as an empty buffer that could never be
-   * saved. */
-  if (!feof(fp)) die(filename);
+   * the next save would truncate the file on disk. */
+  if (!feof(fp)) return -1;
   if (any) {
     E.eol_crlf = saw_cr;
     E.final_newline = had_final_nl;
   }
-  free(line);
+  return 0;
+}
+
+void editor_open(char *filename) {
+  free(E.filename);
+  E.filename = xstrdup(filename);
+  build_recovery_path();
+  have_disk_mtime = 0;
+
+  FILE *fp = fopen(filename, "r");
+  if (!fp) {
+    if (errno == ENOENT) return;
+    die("fopen");
+  }
+  /* The error refusal also covers a directory, which used to open as an
+   * empty buffer that could never be saved. */
+  if (editor_fill_rows(fp) == -1) die(filename);
   /* fstat on the still-open descriptor, not a path-based stat after close:
    * the file could otherwise be replaced between the two calls, baselining
    * the wrong content's mtime. */
@@ -2440,6 +2447,59 @@ void editor_open(char *filename) {
   fclose(fp);
   E.dirty = 0;
   saved_snapshot_take();
+}
+
+/* Startup recovery UX: when the file being opened has a recovery file left by
+ * a crashed session, offer its contents before this session's own save/quit
+ * cleanup removes it. R replaces the buffer with the recovered contents and
+ * marks them dirty, so an accidental Ctrl-S cannot silently drop them; the
+ * file on disk, its mtime baseline and the saved snapshot are deliberately
+ * left alone, because what is saved is still what is on disk. Any other key
+ * continues with the on-disk file, and the stale recovery file is cleaned up
+ * by the usual save/quit unlink exactly as it was before this prompt existed.
+ * Only files named on the command line are offered: an anonymous buffer's
+ * recovery file (olly-recover.PID) has no obvious owner to prompt for. */
+void editor_check_recovery(void) {
+  if (E.filename == NULL || recovery_path[0] == '\0') return;
+  struct stat st;
+  if (stat(recovery_path, &st) == -1 || !S_ISREG(st.st_mode)) return;
+
+  editor_set_status_message(
+      "Unsaved changes from a crashed session. R = restore | any key = drop");
+  editor_refresh_screen();
+  int c;
+  do {
+    c = editor_read_key();
+  } while (c == WINCH_KEY);
+  if (c != 'r' && c != 'R') {
+    editor_set_status_message("Recovery data dropped");
+    return;
+  }
+
+  FILE *fp = fopen(recovery_path, "r");
+  if (fp == NULL) {
+    editor_set_status_message("Restore failed: %s", strerror(errno));
+    return;
+  }
+  int i;
+  for (i = 0; i < E.numrows; i++) editor_free_row(&E.row[i]);
+  E.numrows = 0;
+  E.cx = 0;
+  E.rx = 0;
+  E.cy = 0;
+  E.rowoff = 0;
+  E.coloff = 0;
+  E.sel_active = 0;
+  if (editor_fill_rows(fp) == -1) {
+    /* Only reachable if the file turns unreadable between the stat and the
+     * read; the buffer is left holding whatever was salvaged. */
+    fclose(fp);
+    editor_set_status_message("Restore failed: recovery file unreadable");
+    return;
+  }
+  fclose(fp);
+  E.dirty = 1;
+  editor_set_status_message("Restored unsaved changes (Ctrl-S to keep them)");
 }
 
 /* ---- help screen: data + layout --------------------------------------- *
@@ -2932,6 +2992,10 @@ int main(int argc, char *argv[]) {
 
   editor_set_status_message(
       "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-N = next | Ctrl-? = help");
+
+  /* May replace the HELP message and paint its own frame while it waits for
+   * an answer. */
+  editor_check_recovery();
 
   /* Paint the first frame up front. The loop below reads a key before it
    * paints, so without this the screen stayed blank until the first

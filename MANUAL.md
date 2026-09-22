@@ -297,10 +297,19 @@ If Olly is killed by one of those signals, or exits because it ran out of
 memory, and the buffer had unsaved changes, it writes what was in the buffer
 to a recovery file before it goes. The recovery file sits next to the file you
 were editing, named after it with a `.olly-recover` suffix (for an unnamed
-buffer it is `olly-recover.<pid>` in the current directory). Nothing opens it
-for you — inspect it and rename it over your file if you want to keep it. A
-successful save removes any recovery file for that name, and so does a clean
-`Ctrl-Q` quit.
+buffer it is `olly-recover.<pid>` in the current directory).
+
+The next time you open that file, Olly notices the recovery file and asks:
+
+    Unsaved changes from a crashed session. R = restore | any key = drop
+
+`R` loads the recovered contents over the buffer and marks them unsaved, so
+`Ctrl-S` keeps them; until you save, the buffer holds the recovered data, not
+what is on disk. Any other key continues with the file as it is on disk.
+Either way the recovery file is then removed by the first successful save or
+`Ctrl-Q` quit, so decide at the prompt — after that the data is gone. (This
+prompt only covers named files; for an unnamed buffer, inspect the
+`olly-recover.<pid>` file yourself and rename it over whatever it belongs to.)
 
 After saving, the undo history is kept, but the dirty flag is cleared.
 
