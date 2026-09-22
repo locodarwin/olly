@@ -17,6 +17,7 @@ the arrow keys move around, and the `Ctrl` combinations do the work.
 - [Searching](#searching)
 - [Search and Replace](#search-and-replace)
 - [Undo and Redo](#undo-and-redo)
+- [Opening Another File](#opening-another-file)
 - [Saving and Quitting](#saving-and-quitting)
 - [Keys At a Glance](#keys-at-a-glance)
 - [File Format Notes](#file-format-notes)
@@ -60,7 +61,9 @@ To remove the installed binary:
     olly --version            # print the version and exit (-v works too)
 
 Only one file is edited at a time; any further file arguments are ignored,
-and the status bar says so rather than dropping them silently.
+and the status bar says so rather than dropping them silently. To change
+files from inside Olly, use `Ctrl-O` (see
+[Opening Another File](#opening-another-file)).
 
 If the file does not exist, Olly opens an empty buffer rather than failing.
 A path that exists but cannot be read in full — a directory, for example — is
@@ -250,6 +253,27 @@ row itself, then the character), so it takes two `Ctrl-Z` presses to fully
 undo it. Any edit made after an undo clears the redo history — a fresh
 `Ctrl-Y` will not resurrect changes replaced by newer ones.
 
+## Opening Another File
+
+`Ctrl-O` opens a file browser. It starts in Olly's working directory — the
+directory you started it from — so `cd` wherever you like and browse from
+there.
+
+    Ctrl-O                 Open the file browser
+    Up/Down, Ctrl-P/Ctrl-N Move one entry
+    PgUp/PgDn, Home/End    Jump around the list
+    Enter                  Enter a directory, or open the selected file
+    Esc                    Cancel and return to the buffer
+
+Directories are listed before files, each group alphabetically, with a
+trailing `/` on directory names. Every list offers `..` at the top as the way
+back up; other dot-files are hidden.
+
+The browser replaces the buffer, so it refuses to run while there are unsaved
+changes — save first, and the status bar tells you so. Olly still edits one
+file at a time: opening another file discards the previous buffer along with
+its undo history, and touches nothing on disk.
+
 ## Saving and Quitting
 
 | Key | Action |
@@ -323,6 +347,7 @@ After saving, the undo history is kept, but the dirty flag is cleared.
 ## Keyboard Shortcuts
 
     Ctrl-S   Save file
+    Ctrl-O   Open a file (directory browser)
     Ctrl-Q   Quit (asks several times if there are unsaved changes)
     Ctrl-F   Search forward (case-insensitive by default)
     Ctrl-N   Find next instance of the search

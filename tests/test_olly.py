@@ -1175,6 +1175,87 @@ def test_cli_args(tmpdir):
            any("Warning" in m for m in status_lines(out)), False)
 
 
+# ---------------------------------------------------------------- open ----
+
+def test_open_dialog(tmpdir):
+    print("\nopen dialog: Ctrl-O browses from the working directory")
+    OPEN = "\x0f"
+    cwd = os.getcwd()
+    # A private directory: the browser lists its cwd, so leftover files from
+    # other tests in the shared tmpdir would shift the list positions.
+    d = tempfile.mkdtemp(dir=tmpdir)
+    try:
+        os.chdir(d)
+        os.mkdir(os.path.join(d, "sub"))
+        with open(os.path.join(d, "sub", "inner.txt"), "w") as fh:
+            fh.write("inner body\n")
+        alpha = os.path.join(d, "alpha.txt")
+        zeta = os.path.join(d, "zeta.txt")
+        with open(alpha, "w") as fh:
+            fh.write("alpha body\n")
+        with open(zeta, "w") as fh:
+            fh.write("zeta body\n")
+
+        # List order: ".." first, then the directory, then files.
+        out = run([OLLY], [OPEN])
+        check("Ctrl-O opens the file browser", b"Open File" in out, True)
+        check("the browser starts in the working directory",
+              d.encode() in out, True)
+        check("directories are marked and files listed",
+              b"sub/" in out and b"alpha.txt" in out, True)
+        check("the directory sorts before the files",
+              out.find(b"sub") < out.find(b"alpha.txt"), True)
+        check("'..' is offered as the way back up", b"../" in out, True)
+
+        out = run([OLLY], [OPEN, DOWN, DOWN, "\r"])
+        check("Enter on a file opens it", b"alpha body" in out, True)
+        check("the status bar reports the opened file",
+              any("Opened" in m and "alpha.txt" in m
+                  for m in status_lines(out)), True)
+
+        out = run([OLLY], [OPEN, DOWN, "\r"])
+        check("Enter on a directory descends into it",
+              b"inner.txt" in out, True)
+        out = run([OLLY], [OPEN, DOWN, "\r", "\r"])
+        check("'..' climbs back out", b"alpha.txt" in out, True)
+        out = run([OLLY], [OPEN, DOWN, "\r", DOWN, "\r"])
+        check("a file two levels deep opens", b"inner body" in out, True)
+
+        out = run([OLLY, zeta], [OPEN, "\x1b"])
+        check("Esc closes the dialog without opening anything",
+              any("Opened" in m for m in status_lines(out)), False)
+        check("the original buffer survives the cancel",
+              b"zeta body" in out, True)
+
+        out = run([OLLY, zeta], ["X", OPEN])
+        check("unsaved changes refuse the dialog outright",
+              any("Open aborted" in m and "unsaved" in m
+                  for m in status_lines(out)), True)
+        check("and the browser never opens", b"Open File" in out, False)
+
+        # After the switch, writes and history belong to the new file.
+        run([OLLY, alpha], [OPEN, DOWN, DOWN, DOWN, "\r", "!", SAVE,
+                            "\x11"])
+        with open(alpha) as fh:
+            check("the switch leaves the old file alone",
+                  fh.read(), "alpha body\n")
+        with open(zeta) as fh:
+            check("the new file takes the edit", fh.read(), "!zeta body\n")
+
+        # A pristine target, so the expected undo result is unambiguous.
+        beta = os.path.join(d, "beta.txt")
+        with open(beta, "w") as fh:
+            fh.write("beta body\n")
+        # beta is list index 3: "..", sub/, alpha.txt, beta.txt.
+        run([OLLY, alpha], [OPEN, DOWN, DOWN, DOWN, "\r", "!", UNDO, SAVE,
+                            "\x11"])
+        with open(beta) as fh:
+            check("undo does not cross the switch back to the old buffer",
+                  fh.read(), "beta body\n")
+    finally:
+        os.chdir(cwd)
+
+
 # --------------------------------------------------------- robustness ----
 
 def test_directory_refused(tmpdir):
@@ -1260,6 +1341,7 @@ def main():
         test_recovery(tmpdir)
         test_recovery_prompt(tmpdir)
         test_cli_args(tmpdir)
+        test_open_dialog(tmpdir)
         test_directory_refused(tmpdir)
         test_undo(tmpdir)
         test_undo_cap(tmpdir)

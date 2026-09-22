@@ -43,6 +43,9 @@ All this in a single C file with zero external dependencies.
   with unsaved changes, the buffer is written to a `.olly-recover` file.
 - **Open anything**: never errors on a missing file; it simply starts an
   empty buffer.
+- **Open-file dialog**: `Ctrl-O` opens a directory browser so you can browse
+  to a file instead of relaunching; it replaces the current buffer (unsaved
+  changes are refused first).
 - **Dirty-quit protection**: when there are unsaved changes, `Ctrl-Q` asks
   several times before exiting (counted down in the status bar).
 - **Keyboard reference built in**: press `Ctrl-?` at any time.
@@ -91,6 +94,7 @@ resize the terminal window.
 | Key | Action |
 | --- | --- |
 | `Ctrl-S` | Save |
+| `Ctrl-O` | Open a file (directory browser) |
 | `Ctrl-Q` | Quit (asks several times with unsaved changes) |
 | `Ctrl-F` | Search forward |
 | `Ctrl-N` | Find next match |

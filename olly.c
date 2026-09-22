@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -2430,7 +2431,14 @@ void editor_open(char *filename) {
 
   FILE *fp = fopen(filename, "r");
   if (!fp) {
-    if (errno == ENOENT) return;
+    /* A missing file opens as an empty clean buffer. The dirty/snapshot
+     * reset matters from mid-session too: after switching files the stale
+     * snapshot of the previous buffer must not leak into this one. */
+    if (errno == ENOENT) {
+      E.dirty = 0;
+      saved_snapshot_take();
+      return;
+    }
     die("fopen");
   }
   /* The error refusal also covers a directory, which used to open as an
@@ -2511,6 +2519,7 @@ struct help_group { const char *title; const struct help_item *items; };
 
 static const struct help_item help_items_files[] = {
   {"Ctrl-S",   "Save file"},
+  {"Ctrl-O",   "Open a file"},
   {"Ctrl-Q",   "Quit"},
   {"Ctrl-?",   "This help screen"},
   {NULL, NULL}
@@ -2726,6 +2735,214 @@ void editor_help(void) {
   force_full = 1;
 }
 
+/* ---- open-file dialog -------------------------------------------------- *
+ * A modal read-only directory browser: Ctrl-O opens it in the working
+ * directory, the arrows move through the list, Enter descends into a
+ * directory or picks a file, Esc cancels. Directories sort before files,
+ * each half alphabetically; dotfiles are hidden, with ".." kept as the way
+ * back up. Only readdir/stat are used: the dialog never writes anything. */
+
+struct browser_entry {
+  char *name;
+  int is_dir;
+};
+
+static int browser_cmp(const void *a, const void *b) {
+  const struct browser_entry *ea = a, *eb = b;
+  if (ea->is_dir != eb->is_dir) return eb->is_dir - ea->is_dir;
+  return strcmp(ea->name, eb->name);
+}
+
+static void browser_free(struct browser_entry *ents, int n) {
+  int i;
+  for (i = 0; i < n; i++) free(ents[i].name);
+  free(ents);
+}
+
+/* Read one directory into a freshly allocated, sorted entry array. Returns
+ * the entry count, or -1 if the directory cannot be opened (it may have
+ * been removed since we listed its parent). */
+static int browser_load(const char *dir, struct browser_entry **out) {
+  DIR *dp = opendir(dir);
+  if (dp == NULL) return -1;
+  struct browser_entry *ents = NULL;
+  int n = 0, cap = 0;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) {
+    if (de->d_name[0] == '.' && strcmp(de->d_name, "..") != 0) continue;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+    struct stat st;
+    int is_dir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+    if (n == cap) {
+      cap = cap ? cap * 2 : 32;
+      struct browser_entry *ne = realloc(ents, sizeof(*ents) * (size_t)cap);
+      if (ne == NULL) die("browser_load");
+      ents = ne;
+    }
+    ents[n].name = xstrdup(de->d_name);
+    ents[n].is_dir = is_dir;
+    n++;
+  }
+  closedir(dp);
+  if (n > 1) qsort(ents, (size_t)n, sizeof(*ents), browser_cmp);
+  *out = ents;
+  return n;
+}
+
+/* Truncate a name to fit a table cell without splitting a UTF-8 sequence:
+ * a file name is arbitrary bytes and the box has fixed columns. */
+static void browser_fit(const char *s, int w, char *dst, size_t dsz) {
+  int n = 0;
+  while (s[n] != '\0' && n < w) n++;
+  while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+  snprintf(dst, dsz, "%.*s", n, s);
+}
+
+/* The dialog itself: returns a malloc'd path to open, or NULL if the user
+ * cancelled. Like the help screen it owns the terminal until dismissed, so
+ * it re-reads the window size itself and repaints the whole frame per pass. */
+static char *editor_open_dialog(void) {
+  char dir[PATH_MAX];
+  if (getcwd(dir, sizeof(dir)) == NULL) snprintf(dir, sizeof(dir), ".");
+
+  struct browser_entry *ents;
+  int n = browser_load(dir, &ents);
+  if (n == -1) {
+    snprintf(dir, sizeof(dir), ".");
+    n = browser_load(dir, &ents);
+    if (n == -1) return NULL;
+  }
+
+  int sel = 0, top = 0;
+  const char *msg = "";
+  for (;;) {
+    help_refresh_size();
+    int view_h = E.screenrows - 4;   /* title, dir line, two footer rows */
+    if (view_h < 1) view_h = 1;
+    if (sel >= n) sel = (n > 0) ? n - 1 : 0;
+    if (sel < top) top = sel;
+    if (sel >= top + view_h) top = sel - view_h + 1;
+
+    struct abuf ab = ABUF_INIT;
+    ab_append(&ab, "\x1b[2J", 4);
+    ab_append(&ab, "\x1b[?25l", 6);
+    char pos[32];
+    help_centered(&ab, "Olly - Open File", 1);
+
+    /* Current directory on row 2; if it does not fit, the tail still shows
+     * which corner of the tree we are in, cut only at a UTF-8 boundary. */
+    int dl = (int)strlen(dir);
+    int wmax = E.screencols - 2;
+    if (wmax < 1) wmax = 1;
+    const char *dshow = dir;
+    if (dl > wmax) {
+      dshow = dir + dl - wmax;
+      while (*dshow != '\0' && ((unsigned char)*dshow & 0xC0) == 0x80)
+        dshow++;
+    }
+    snprintf(pos, sizeof(pos), "\x1b[2;2H");
+    ab_append(&ab, pos, strlen(pos));
+    ab_append(&ab, dshow, (int)strlen(dshow));
+    ab_append(&ab, "\x1b[K", 3);
+
+    int k;
+    for (k = 0; k < view_h && top + k < n; k++) {
+      struct browser_entry *e = &ents[top + k];
+      char name[PATH_MAX];
+      browser_fit(e->name, E.screencols - 2, name, sizeof(name));
+      snprintf(pos, sizeof(pos), "\x1b[%d;2H%s", 4 + k,
+               e == &ents[sel] ? "\x1b[7m" : "");
+      ab_append(&ab, pos, strlen(pos));
+      if (e->is_dir) {
+        ab_append(&ab, name, (int)strlen(name));
+        ab_append(&ab, "/", 1);
+      } else {
+        ab_append(&ab, name, (int)strlen(name));
+      }
+      ab_append(&ab, e == &ents[sel] ? "\x1b[27m\x1b[K" : "\x1b[K",
+                e == &ents[sel] ? 8 : 3);
+    }
+    if (n == 0) {
+      help_centered(&ab, "(empty directory)", 4);
+    }
+
+    help_centered(&ab,
+        "Arrows/PgUp/PgDn move  Enter select  Esc cancel",
+        E.screenrows - 1);
+    help_centered(&ab, msg, E.screenrows);
+
+    write_all(STDOUT_FILENO, ab.b, (size_t)ab.len);
+    free(ab.b);
+    msg = "";
+
+    int c = editor_read_key();
+    if (c == WINCH_KEY) continue;
+    int ns = sel;
+    if (c == ARROW_DOWN || c == CTRL_KEY('n')) ns = sel + 1;
+    else if (c == ARROW_UP || c == CTRL_KEY('p')) ns = sel - 1;
+    else if (c == PAGE_DOWN) ns = sel + view_h;
+    else if (c == PAGE_UP) ns = sel - view_h;
+    else if (c == HOME_KEY) ns = 0;
+    else if (c == END_KEY) ns = n - 1;
+    else if (c == '\r') {
+      if (n == 0) continue;
+      char path[PATH_MAX];
+      snprintf(path, sizeof(path), "%s/%s", dir, ents[sel].name);
+      if (!ents[sel].is_dir) {
+        browser_free(ents, n);
+        return xstrdup(path);
+      }
+      struct browser_entry *ne;
+      int nn = browser_load(path, &ne);
+      if (nn == -1) {
+        msg = "Cannot enter that directory";
+        continue;
+      }
+      browser_free(ents, n);
+      ents = ne;
+      n = nn;
+      snprintf(dir, sizeof(dir), "%s", path);
+      sel = 0;
+      top = 0;
+      continue;
+    } else if (c == 27 || c == CTRL_KEY('c')) {
+      break;
+    } else {
+      continue;
+    }
+    if (ns < 0) ns = 0;
+    if (ns > n - 1) ns = (n > 0) ? n - 1 : 0;
+    sel = ns;
+  }
+  browser_free(ents, n);
+  force_full = 1;
+  return NULL;
+}
+
+/* Replace the whole buffer with another file: the point of the dialog. The
+ * editor only ever edits one file, so everything that belonged to the old
+ * one -- rows, cursor, selection, undo history, line-ending flags -- goes
+ * with it. The caller guarantees no unsaved changes. */
+static void editor_switch_file(char *path) {
+  int i;
+  for (i = 0; i < E.numrows; i++) editor_free_row(&E.row[i]);
+  E.numrows = 0;
+  E.cx = 0;
+  E.rx = 0;
+  E.cy = 0;
+  E.rowoff = 0;
+  E.coloff = 0;
+  E.sel_active = 0;
+  editor_free_undo_redo();
+  E.eol_crlf = 0;
+  E.final_newline = 1;
+  editor_open(path);
+  free(path);
+  editor_set_status_message("Opened %s - %d lines",
+      E.filename ? E.filename : "(unnamed)", E.numrows);
+}
+
 void editor_process_keypress(void) {
   static int quit_times = KILO_QUIT_TIMES;
   int c = editor_read_key();
@@ -2758,6 +2975,21 @@ void editor_process_keypress(void) {
     case CTRL_KEY('s'):
       editor_save();
       break;
+
+    case CTRL_KEY('o'): {
+      /* One buffer, one file: the open dialog replaces the buffer, so it
+       * is refused while there is unsaved work rather than silently
+       * discarding it. */
+      if (E.dirty) {
+        editor_set_status_message(
+            "Open aborted: file has unsaved changes (Ctrl-S first)");
+        break;
+      }
+      char *path = editor_open_dialog();
+      force_full = 1;
+      if (path != NULL) editor_switch_file(path);
+      break;
+    }
 
     case CTRL_KEY('z'):
       editor_undo();
