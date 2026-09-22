@@ -54,6 +54,13 @@ To remove the installed binary:
     olly file.txt             # open an existing file
     olly brand-new.txt        # open a file that does not exist yet (created
                               # empty; saved only when you save it)
+    olly file.txt +42         # open with the cursor on line 42 (the number
+                              # may also come before the file name, and a
+                              # line past the end clamps to the last line)
+    olly --version            # print the version and exit (-v works too)
+
+Only one file is edited at a time; any further file arguments are ignored,
+and the status bar says so rather than dropping them silently.
 
 If the file does not exist, Olly opens an empty buffer rather than failing.
 A path that exists but cannot be read in full — a directory, for example — is

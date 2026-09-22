@@ -74,6 +74,8 @@ target with `make install PREFIX=/some/dir` or stage a package with
 olly                 # start with an unnamed buffer
 olly file.txt        # open an existing file
 olly new.txt         # open a buffer for a file that doesn't exist yet
+olly file.txt +42    # open with the cursor on line 42 (+42 file.txt works too)
+olly --version       # print the version and exit
 ```
 
 Edit immediately. Every key you type is inserted at the cursor. Save with

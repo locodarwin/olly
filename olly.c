@@ -2984,11 +2984,67 @@ void init_editor(void) {
   force_full = 1;
 }
 
+/* Is this argument a "+N" start-line request? Digits only after the plus:
+ * an argument like "+foo" is treated as a (peculiar) file name instead, so
+ * files whose names begin with a plus stay reachable. */
+static int arg_is_line(const char *s, long *out) {
+  if (s[0] != '+') return 0;
+  const char *p;
+  for (p = s + 1; *p != '\0'; p++)
+    if (*p < '0' || *p > '9') return 0;
+  if (p == s + 1) return 0;
+  long v = strtol(s + 1, NULL, 10);
+  *out = (v > 1000000000L) ? 1000000000L : v;
+  return 1;
+}
+
+/* olly [--version | -v] [file] [+line] ...
+ * The file is the first argument that is not a flag or a line request;
+ * anything past that is reported on the status bar and ignored. */
 int main(int argc, char *argv[]) {
+  char *filename = NULL;
+  long startline = 0;
+  int have_line = 0;
+  char *first_extra = NULL;
+  int num_extra = 0;
+  int i;
+  for (i = 1; i < argc; i++) {
+    const char *a = argv[i];
+    if (strcmp(a, "--version") == 0 || strcmp(a, "-v") == 0 ||
+        strcmp(a, "-V") == 0) {
+      printf("olly %s\n", OLLY_VERSION);
+      return 0;
+    }
+    long n;
+    if (arg_is_line(a, &n)) {
+      startline = n;
+      have_line = 1;
+      continue;
+    }
+    if (filename == NULL) {
+      filename = (char *)a;
+      continue;
+    }
+    if (first_extra == NULL) first_extra = (char *)a;
+    num_extra++;
+  }
+
   enable_raw_mode();
   atexit(editor_cleanup);
   init_editor();
-  if (argc >= 2) editor_open(argv[1]);
+  if (filename != NULL) editor_open(filename);
+
+  if (have_line) {
+    /* Same clamping as Ctrl-G: land on a real row, never on the phantom
+     * row past the last one; the refresh scrolls it into view. */
+    int max_cy = (E.numrows > 0) ? E.numrows - 1 : 0;
+    int target = (int)startline - 1;
+    if (target < 0) target = 0;
+    if (target > max_cy) target = max_cy;
+    E.cy = target;
+    E.rx = 0;
+    E.cx = 0;
+  }
 
   editor_set_status_message(
       "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-N = next | Ctrl-? = help");
@@ -2996,6 +3052,10 @@ int main(int argc, char *argv[]) {
   /* May replace the HELP message and paint its own frame while it waits for
    * an answer. */
   editor_check_recovery();
+
+  if (num_extra > 0)
+    editor_set_status_message("Warning: ignored %d extra argument%s (e.g. %s)",
+        num_extra, num_extra > 1 ? "s" : "", first_extra);
 
   /* Paint the first frame up front. The loop below reads a key before it
    * paints, so without this the screen stayed blank until the first

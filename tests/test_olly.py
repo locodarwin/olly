@@ -1120,6 +1120,61 @@ def test_recovery_prompt(tmpdir):
           body, "rescued\n")
 
 
+# ------------------------------------------------------------ command ----
+
+def test_cli_args(tmpdir):
+    print("\ncommand line: --version, +line, and ignored extra arguments")
+    path = os.path.join(tmpdir, "five.txt")
+    with open(path, "w") as fh:
+        fh.write("one\ntwo\nthree\nfour\nfive\n")
+
+    def cursor_row(out):
+        text = out.decode("latin-1")
+        m = re.findall(r"\x1b\[(\d+);(\d+)H", text)
+        return int(m[-1][0]) if m else None
+
+    out, st = run([OLLY, "--version"], [], status=True)
+    check("--version prints the version and exits cleanly",
+          out.strip().decode().startswith("olly 1."), True)
+    check("--version exits with status 0", os.WIFEXITED(st)
+          and os.WEXITSTATUS(st) == 0, True)
+    out, _ = run([OLLY, "-v"], [], status=True)
+    check("-v is the short form", out.strip().decode().startswith("olly "),
+          True)
+
+    check("+N opens with the cursor on that line",
+          cursor_row(run([OLLY, path, "+3"], [])), 3)
+    check("+N also works before the file name",
+          cursor_row(run([OLLY, "+2", path], [])), 2)
+    check("+1 lands on the first line",
+          cursor_row(run([OLLY, path, "+1"], [])), 1)
+    check("a line past the end clamps to the last row",
+          cursor_row(run([OLLY, path, "+999"], [])), 5)
+    check("a high line scrolls the last row into view",
+          b"five" in run([OLLY, path, "+999"], []), True)
+    # "+x" is not a line request: as the file it opens, as an extra it warns.
+    out, _ = run([OLLY, path, "+x"], [], status=True)
+    check("+x is not swallowed as a line request",
+          any("+x" in m for m in status_lines(out)), True)
+
+    # An argument beyond the file is reported rather than silently dropped.
+    extra = os.path.join(tmpdir, "other.txt")
+    out, _ = run([OLLY, path, extra], [], status=True)
+    msgs = status_lines(out)
+    check("an extra argument warns on the status bar",
+          any("extra argument" in m for m in msgs), True)
+    check("the warning names the ignored argument",
+          any("other.txt" in m for m in msgs), True)
+    out, _ = run([OLLY, path, extra, extra, extra], [], status=True)
+    check("several extras are counted",
+          any("3 extra arguments" in m for m in status_lines(out)), True)
+
+    # With no file at all, +N just starts an empty buffer at the top.
+    out, _ = run([OLLY, "+50"], [], status=True)
+    check("+N with no file opens an empty buffer without complaint",
+           any("Warning" in m for m in status_lines(out)), False)
+
+
 # --------------------------------------------------------- robustness ----
 
 def test_directory_refused(tmpdir):
@@ -1204,6 +1259,7 @@ def main():
         test_signals(tmpdir)
         test_recovery(tmpdir)
         test_recovery_prompt(tmpdir)
+        test_cli_args(tmpdir)
         test_directory_refused(tmpdir)
         test_undo(tmpdir)
         test_undo_cap(tmpdir)
