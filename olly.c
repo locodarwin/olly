@@ -179,8 +179,9 @@ static char *xstrdup(const char *s) {
 
 /* --- UTF-8: the buffer holds raw bytes, but the cursor moves and deletes by
  * whole characters, so editing never splits a multibyte sequence and leaves
- * invalid bytes behind. (On-screen column width for wide or combining glyphs
- * is not yet modelled; a character is treated as one display column.) --- */
+ * invalid bytes behind. On-screen column width for wide and combining glyphs
+ * is modelled too (see olly_wcwidth below), so the cursor, horizontal scroll
+ * and the row renderer all agree on where a character lands. --- */
 
 static int utf8_is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
 
@@ -1803,6 +1804,14 @@ void editor_refresh_screen(void) {
     ab_append(&ab, "\x1b[H", 3);
     force_full = 0;
   } else {
+    /* The status bar and message bar live just past the last text row, so they
+     * are invalidated here rather than through cache_line_draw. Nothing above
+     * has grown the cache that far: the draw path below only ever reaches
+     * cache_ensure(y) for y < screenrows, and cache_ensure doubles from 32, so
+     * in a terminal exactly 32 (or 64, 128, ...) text rows tall -- or one row
+     * short of one -- these two slots were being written past the end of all
+     * three arrays. Ensure the capacity before indexing them. */
+    cache_ensure(E.screenrows + 1);
     cache_lines[E.screenrows] = NULL;
     cache_lens[E.screenrows] = -1;
     cache_caps[E.screenrows] = 0;
