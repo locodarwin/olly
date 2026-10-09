@@ -203,8 +203,10 @@ status bar reports which mode is now active. The setting applies to `Ctrl-F`,
 `Ctrl-N`, `Ctrl-P`, and search-and-replace alike. The case-insensitive fold
 covers ASCII `a`-`z` only — every other byte is compared as-is, so accented
 letters match only themselves. A match always spans whole characters: a
-query that would begin or end inside a UTF-8 character never matches, which
-also guarantees a replace can never splice a character in half.
+query that would begin or end inside a UTF-8 character — or partway through
+the on-screen blanks a `Tab` expands to — never matches. This keeps every
+match anchored to real characters, so a replace can never splice a character
+in half or consume only part of a tab.
 
 ## Search and Replace
 
@@ -368,9 +370,11 @@ After saving, the undo history is kept, but the dirty flag is cleared.
 
 ## File Format Notes
 
-- Line endings are preserved. A file loaded with Windows `CRLF` endings is
-  saved back with `CRLF`; a Unix `LF` file stays `LF`. A brand-new file uses
-  `LF`.
+- Line endings are preserved per line. A file loaded with Windows `CRLF`
+  endings is saved back with `CRLF`; a Unix `LF` file stays `LF`; and a file
+  that mixes the two keeps each line's own ending rather than being
+  normalised to one style. Line breaks you add while editing follow the
+  file's first line, and a brand-new file uses `LF`.
 - A trailing newline is preserved too: if the file you opened ended without
   one, the save leaves it without one. A brand-new file is given a trailing
   newline.

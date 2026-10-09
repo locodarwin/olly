@@ -45,6 +45,7 @@ typedef struct erow {
   int rcap;
   char *chars;
   char *render;
+  int crlf;       /* line terminator is CRLF (not LF) when written out */
 } erow;
 
 struct editorConfig {
@@ -86,6 +87,9 @@ struct uchange {
   size_t len;
   int cx0, cy0, cx1, cy1;
   int group;  /* 0 = standalone; otherwise shared id of a multi-edit group */
+  /* For SPLIT/JOIN: line endings to restore. up_crlf is this row's own
+   * terminator after a split; lo_crlf is the lower (new or merged) row's. */
+  int up_crlf, lo_crlf;
 };
 
 struct undoState {
@@ -315,6 +319,7 @@ void saved_snapshot_take(void) {
   saved_numrows = E.numrows;
   for (i = 0; i < saved_numrows; i++) {
     saved_rows[i].size = E.row[i].size;
+    saved_rows[i].crlf = E.row[i].crlf;
     saved_rows[i].chars = malloc((size_t)E.row[i].size + 1);
     if (saved_rows[i].chars != NULL) {
       memcpy(saved_rows[i].chars, E.row[i].chars, (size_t)E.row[i].size);
@@ -737,6 +742,7 @@ void editor_insert_row(int at, char *s, size_t len) {
   E.row[at].rsize = 0;
   E.row[at].render = NULL;
   E.row[at].rcap = 0;
+  E.row[at].crlf = E.eol_crlf;  /* default; loaders and splitters override it */
   editor_update_row(&E.row[at]);
 
   E.numrows++;
@@ -815,6 +821,8 @@ struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) 
   u->cy0 = 0;
   u->cx1 = 0;
   u->cy1 = 0;
+  u->up_crlf = 0;
+  u->lo_crlf = 0;
   u->group = U.active_group;
   return u;
 }
@@ -936,6 +944,7 @@ void uc_do_join(struct uchange *u) {
   editor_row_append_string(&E.row[u->row], E.row[u->row + 1].chars,
       E.row[u->row + 1].size);
   editor_delete_row(u->row + 1);
+  E.row[u->row].crlf = u->lo_crlf;  /* merged line keeps the lower ending */
 }
 
 void uc_do_split(struct uchange *u) {
@@ -944,6 +953,8 @@ void uc_do_split(struct uchange *u) {
   row = &E.row[u->row];
   row->size = u->at;
   row->chars[row->size] = '\0';
+  row->crlf = u->up_crlf;
+  E.row[u->row + 1].crlf = u->lo_crlf;
   editor_update_row(row);
 }
 
@@ -1136,17 +1147,22 @@ void editor_insert_newline(void) {
     editor_insert_row(E.cy, "", 0);
   } else {
     erow *row = &E.row[E.cy];
+    int old_crlf = row->crlf;
     struct uchange *u =
         uc_new(UC_SPLIT, E.cy, E.cx, row->chars + E.cx, row->size - E.cx);
     u->cx0 = E.cx;
     u->cy0 = E.cy;
     u->cx1 = 0;
     u->cy1 = E.cy + 1;
+    u->up_crlf = E.eol_crlf;  /* the freshly created break */
+    u->lo_crlf = old_crlf;    /* moved-down tail keeps the old terminator */
     undo_push(u);
     editor_insert_row(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
     row = &E.row[E.cy];
     row->size = E.cx;
     row->chars[row->size] = '\0';
+    row->crlf = E.eol_crlf;
+    E.row[E.cy + 1].crlf = old_crlf;
     editor_update_row(row);
   }
   E.cy++;
@@ -1205,18 +1221,22 @@ void editor_delete_char(void) {
     E.cx = at;
   } else {
     erow *prev = &E.row[E.cy - 1];
+    int lo = row->crlf;  /* the line pulled up carries the surviving ending */
     struct uchange *u =
         uc_new(UC_JOIN, E.cy - 1, prev->size, row->chars, row->size);
     u->cx0 = pre_cx;
     u->cy0 = pre_cy;
     u->cx1 = prev->size;
     u->cy1 = E.cy - 1;
+    u->up_crlf = prev->crlf;
+    u->lo_crlf = lo;
     undo_push(u);
     clear_redo();
     E.cx = prev->size;
     editor_row_append_string(prev, row->chars, row->size);
     editor_delete_row(E.cy);
     E.cy--;
+    E.row[E.cy].crlf = lo;
   }
   U.locked = 0;
 }
@@ -1252,6 +1272,7 @@ void editor_del_char(void) {
     }
     editor_row_delete_n(row, E.cx, nbytes);
   } else if (E.cy < E.numrows - 1) {
+    int lo = E.row[E.cy + 1].crlf;  /* lower line's terminator survives */
     struct uchange *u =
         uc_new(UC_JOIN, E.cy, row->size, E.row[E.cy + 1].chars,
             E.row[E.cy + 1].size);
@@ -1259,10 +1280,13 @@ void editor_del_char(void) {
     u->cy0 = pre_cy;
     u->cx1 = row->size;
     u->cy1 = E.cy;
+    u->up_crlf = row->crlf;
+    u->lo_crlf = lo;
     undo_push(u);
     clear_redo();
     editor_row_append_string(row, E.row[E.cy + 1].chars, E.row[E.cy + 1].size);
     editor_delete_row(E.cy + 1);
+    row->crlf = lo;
   }
   U.locked = 0;
 }
@@ -1928,6 +1952,20 @@ static int match_is_char_aligned(const char *hay, int n) {
          !utf8_is_cont((unsigned char)hay[n]);
 }
 
+/* Reject a match that begins or ends inside a tab's on-screen expansion.
+ * Search scans the tab-expanded render buffer, so a query of spaces could
+ * otherwise match the blanks a tab paints; that "match" maps back to a
+ * zero-width slice of real characters, so a replace deletes nothing and --
+ * under replace-all -- the untouched tab repaints a fresh match at the
+ * advanced cursor, spinning forever. Requiring both ends to land on real
+ * character boundaries keeps every match anchored to actual bytes. */
+static int match_tab_aligned(erow *row, int col, int qlen) {
+  int cxs = editor_render_byte_to_cx(row, col);
+  int cxe = editor_render_byte_to_cx(row, col + qlen);
+  return editor_row_cx_to_rbyte(row, cxs) == col &&
+         editor_row_cx_to_rbyte(row, cxe) == col + qlen;
+}
+
 /* How far the sweep may run before giving up. */
 enum search_sweep {
   SEARCH_WRAP,      /* full circle, starting row revisited from its start */
@@ -1983,7 +2021,8 @@ static int editor_search_string(const char *query, int qlen, int dir,
       int col;
       for (col = start; col <= maxstart; col++) {
         if (render_match(row->render + col, query, qlen) &&
-            match_is_char_aligned(row->render + col, qlen)) {
+            match_is_char_aligned(row->render + col, qlen) &&
+            match_tab_aligned(row, col, qlen)) {
           E.cy = i;
           E.cx = editor_render_byte_to_cx(row, col);
           return 1;
@@ -1996,7 +2035,8 @@ static int editor_search_string(const char *query, int qlen, int dir,
       int col;
       for (col = start; col >= 0; col--) {
         if (render_match(row->render + col, query, qlen) &&
-            match_is_char_aligned(row->render + col, qlen)) {
+            match_is_char_aligned(row->render + col, qlen) &&
+            match_tab_aligned(row, col, qlen)) {
           E.cy = i;
           E.cx = editor_render_byte_to_cx(row, col);
           return 1;
@@ -2187,13 +2227,13 @@ void editor_replace(void) {
  * two syscalls per line, 100,000 of them for a 50,000-line file. */
 static int editor_write_rows(int fd, size_t *total) {
   static char buf[65536];
-  const char *eol = E.eol_crlf ? "\r\n" : "\n";
-  size_t eollen = E.eol_crlf ? 2 : 1;
   size_t used = 0, n = 0;
   int j;
   for (j = 0; j < E.numrows; j++) {
     size_t len = (size_t)E.row[j].size;
-    size_t elen = (j == E.numrows - 1 && !E.final_newline) ? 0 : eollen;
+    const char *eol = E.row[j].crlf ? "\r\n" : "\n";
+    size_t elen = E.row[j].crlf ? 2 : 1;
+    if (j == E.numrows - 1 && !E.final_newline) elen = 0;
     if (used + len + elen > sizeof(buf)) {
       if (write_all(fd, buf, used) == -1) return -1;
       used = 0;
@@ -2403,22 +2443,27 @@ int editor_fill_rows(FILE *fp) {
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
-  int any = 0, saw_cr = 0, had_final_nl = 1;
+  int any = 0, had_final_nl = 1, default_crlf = 0, have_default = 0;
   while ((linelen = getline(&line, &linecap, fp)) != -1) {
     any = 1;
     /* Whether this line -- so, once the loop ends, the last line -- carried a
-     * trailing newline, and whether the endings were CRLF. Both are preserved
-     * on save instead of being silently rewritten. */
+     * trailing newline. Preserved on save instead of being silently added. */
     had_final_nl = (linelen > 0 && line[linelen - 1] == '\n');
-    int had_cr = 0;
+    /* Per-line ending: CRLF only when this line really ended in "\r\n". Kept
+     * per row (set below) so a file of mixed endings is written back
+     * byte-for-byte rather than normalised to a single style. */
+    int line_crlf = (linelen >= 2 && line[linelen - 1] == '\n' &&
+                     line[linelen - 2] == '\r');
     while (linelen > 0 && (line[linelen - 1] == '\n' ||
-        line[linelen - 1] == '\r')) {
-      if (line[linelen - 1] == '\r') had_cr = 1;
+        line[linelen - 1] == '\r'))
       linelen--;
+    if (had_final_nl && !have_default) {
+      default_crlf = line_crlf;  /* style for breaks added later by editing */
+      have_default = 1;
     }
-    if (had_cr) saw_cr = 1;
     if (linelen > INT_MAX - 1) die("line too long");
     editor_insert_row(E.numrows, line, (size_t)linelen);
+    E.row[E.numrows - 1].crlf = line_crlf;
   }
   free(line);
   /* getline returns -1 for a read error as well as at end of file. Taking an
@@ -2426,7 +2471,7 @@ int editor_fill_rows(FILE *fp) {
    * the next save would truncate the file on disk. */
   if (!feof(fp)) return -1;
   if (any) {
-    E.eol_crlf = saw_cr;
+    E.eol_crlf = default_crlf;
     E.final_newline = had_final_nl;
   }
   return 0;
