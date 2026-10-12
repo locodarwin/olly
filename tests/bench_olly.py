@@ -57,6 +57,9 @@ def main():
     report("replace-all large", large, [REPLACE, "alpha", "\r", "ALPHA", "\r",
                                          "a", "\r", SAVE, QUIT], olly)
     report("row insertion", small, [END, "\r", SAVE, QUIT], olly)
+    report("undo eviction", small, ["x"] * 20 + ["\x1a"] * 20 +
+           [SAVE, QUIT], olly)
+    report("resize redraw", small, [(24, 80), (40, 120), (24, 80), QUIT], olly)
 
 
 if __name__ == "__main__":
