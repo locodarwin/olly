@@ -633,7 +633,7 @@ static void install_signal_handlers(void) {
   sigemptyset(&sa.sa_mask);
   /* The handler is reset to the default on entry, so the raise() in it ends
    * the process with the signal's normal action. */
-  sa.sa_flags = SA_RESETHAND;
+  sa.sa_flags = (int)SA_RESETHAND;
   for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
     sigaction(sigs[i], &sa, NULL);
 
@@ -654,10 +654,10 @@ static void enable_raw_mode(void) {
   install_signal_handlers();
 
   struct termios raw = E.orig_termios;
-  raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-  raw.c_oflag &= ~(OPOST);
-  raw.c_cflag |= (CS8);
-  raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+  raw.c_iflag &= (tcflag_t)~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+  raw.c_oflag &= (tcflag_t)~(tcflag_t)OPOST;
+  raw.c_cflag |= (tcflag_t)CS8;
+  raw.c_lflag &= (tcflag_t)~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
   raw.c_cc[VMIN] = 0;
   raw.c_cc[VTIME] = 1;
 
@@ -845,6 +845,7 @@ static void editor_update_row(erow *row) {
 
 static void editor_insert_row(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
+  if (len > (size_t)INT_MAX) die("line too long");
   /* Allocate the new row's text before touching the array. The memmove below
    * duplicates each shifted row's pointers into the next slot for an instant;
    * if an allocation failed after that and died, editor_cleanup would free
@@ -863,7 +864,7 @@ static void editor_insert_row(int at, char *s, size_t len) {
   memmove(&E.row[at + 1], &E.row[at],
       sizeof(erow) * (size_t)(E.numrows - at));
 
-  E.row[at].size = len;
+  E.row[at].size = (int)len;
   E.row[at].chars = chars;
   E.row[at].rsize = 0;
   E.row[at].render = NULL;
@@ -911,7 +912,7 @@ static void editor_row_append_string(erow *row, char *s, size_t len) {
 static void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = xrealloc(row->chars, (size_t)row->size + n + 1);
-  memmove(&row->chars[at + n], &row->chars[at],
+  memmove(&row->chars[(size_t)at + n], &row->chars[at],
       (size_t)(row->size - at + 1));
   memcpy(&row->chars[at], s, n);
   row->size += n;
@@ -1059,19 +1060,20 @@ static void uc_do_insert(struct uchange *u) {
 }
 
 static void uc_do_delete(struct uchange *u) {
-  editor_row_delete_n(&E.row[u->row], u->at, u->len);
+  editor_row_delete_n(&E.row[u->row], u->at, (int)u->len);
 }
 
 static void uc_do_join(struct uchange *u) {
   editor_row_append_string(&E.row[u->row], E.row[u->row + 1].chars,
-      E.row[u->row + 1].size);
+      (size_t)E.row[u->row + 1].size);
   editor_delete_row(u->row + 1);
   E.row[u->row].crlf = u->lo_crlf;  /* merged line keeps the lower ending */
 }
 
 static void uc_do_split(struct uchange *u) {
   erow *row = &E.row[u->row];
-  editor_insert_row(u->row + 1, row->chars + u->at, row->size - u->at);
+  editor_insert_row(u->row + 1, row->chars + u->at,
+      (size_t)(row->size - u->at));
   row = &E.row[u->row];
   row->size = u->at;
   row->chars[row->size] = '\0';
@@ -1240,13 +1242,13 @@ static void editor_insert_char(int c) {
   if (!U.locked && top && top->kind == UC_INSERT && top->row == E.cy &&
       top->at + (int)top->len == E.cx - 1) {
     top->text = xrealloc(top->text, top->len + 2);
-    top->text[top->len++] = c;
+    top->text[top->len++] = (char)c;
     top->text[top->len] = '\0';
     U.undo_bytes++;
     top->cx1 = E.cx;
     top->cy1 = E.cy;
   } else {
-    char ch = c;
+    char ch = (char)c;
     struct uchange *u = uc_new(UC_INSERT, E.cy, E.cx - 1, &ch, 1);
     u->cx0 = pre_cx;
     u->cy0 = pre_cy;
@@ -1271,7 +1273,8 @@ static void editor_insert_newline(void) {
     erow *row = &E.row[E.cy];
     int old_crlf = row->crlf;
     struct uchange *u =
-        uc_new(UC_SPLIT, E.cy, E.cx, row->chars + E.cx, row->size - E.cx);
+        uc_new(UC_SPLIT, E.cy, E.cx, row->chars + E.cx,
+            (size_t)(row->size - E.cx));
     u->cx0 = E.cx;
     u->cy0 = E.cy;
     u->cx1 = 0;
@@ -1279,7 +1282,8 @@ static void editor_insert_newline(void) {
     u->up_crlf = E.eol_crlf;  /* the freshly created break */
     u->lo_crlf = old_crlf;    /* moved-down tail keeps the old terminator */
     undo_push(u);
-    editor_insert_row(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+    editor_insert_row(E.cy + 1, &row->chars[E.cx],
+        (size_t)(row->size - E.cx));
     row = &E.row[E.cy];
     row->size = E.cx;
     row->chars[row->size] = '\0';
@@ -1345,7 +1349,8 @@ static void editor_delete_char(void) {
     erow *prev = &E.row[E.cy - 1];
     int lo = row->crlf;  /* the line pulled up carries the surviving ending */
     struct uchange *u =
-        uc_new(UC_JOIN, E.cy - 1, prev->size, row->chars, row->size);
+        uc_new(UC_JOIN, E.cy - 1, prev->size, row->chars,
+            (size_t)row->size);
     u->cx0 = pre_cx;
     u->cy0 = pre_cy;
     u->cx1 = prev->size;
@@ -1355,7 +1360,7 @@ static void editor_delete_char(void) {
     undo_push(u);
     clear_redo();
     E.cx = prev->size;
-    editor_row_append_string(prev, row->chars, row->size);
+    editor_row_append_string(prev, row->chars, (size_t)row->size);
     editor_delete_row(E.cy);
     E.cy--;
     E.row[E.cy].crlf = lo;
@@ -1372,7 +1377,7 @@ static void editor_del_char(void) {
     struct uchange *top = U.undo_n ? U.undo[U.undo_n - 1] : NULL;
     if (nbytes == 1 && !U.locked && top && top->kind == UC_DELETE &&
         top->row == E.cy && top->at == E.cx && !top->back) {
-      size_t at = E.cx;
+      size_t at = (size_t)E.cx;
       size_t l = top->len;
       top->text = xrealloc(top->text, l + 2);
       top->text[l] = row->chars[at];
@@ -1397,7 +1402,7 @@ static void editor_del_char(void) {
     int lo = E.row[E.cy + 1].crlf;  /* lower line's terminator survives */
     struct uchange *u =
         uc_new(UC_JOIN, E.cy, row->size, E.row[E.cy + 1].chars,
-            E.row[E.cy + 1].size);
+            (size_t)E.row[E.cy + 1].size);
     u->cx0 = pre_cx;
     u->cy0 = pre_cy;
     u->cx1 = row->size;
@@ -1406,7 +1411,8 @@ static void editor_del_char(void) {
     u->lo_crlf = lo;
     undo_push(u);
     clear_redo();
-    editor_row_append_string(row, E.row[E.cy + 1].chars, E.row[E.cy + 1].size);
+    editor_row_append_string(row, E.row[E.cy + 1].chars,
+        (size_t)E.row[E.cy + 1].size);
     editor_delete_row(E.cy + 1);
     row->crlf = lo;
   }
@@ -1917,7 +1923,7 @@ static void editor_draw_message_bar(struct abuf *ab) {
   int rplen = snprintf(rp, sizeof(rp), "\x1b[%d;1H", E.screenrows + 2);
   ab_append(ab, rp, rplen);
   ab_append(ab, "\x1b[K", 3);
-  int msglen = strlen(E.statusmsg);
+  int msglen = (int)strlen(E.statusmsg);
   if (msglen > E.screencols) msglen = E.screencols;
   if (msglen && time(NULL) - E.statusmsg_time < 5)
     ab_append(ab, E.statusmsg, msglen);
@@ -1973,7 +1979,7 @@ static void editor_refresh_screen(void) {
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
       (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1 + E.gutter_w);
-  ab_append(&ab, buf, strlen(buf));
+  ab_append(&ab, buf, (int)strlen(buf));
 
   ab_append(&ab, "\x1b[?25h", 6);
   write_all(STDOUT_FILENO, ab.b, (size_t)ab.len);
@@ -1995,7 +2001,16 @@ static char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
   buf[0] = '\0';
 
   while (1) {
-    editor_set_status_message(prompt, buf);
+    const char *slot = strstr(prompt, "%s");
+    if (slot != NULL) {
+      char rendered[sizeof(E.statusmsg)];
+      int prefix = (int)(slot - prompt);
+      snprintf(rendered, sizeof(rendered), "%.*s%s%s", prefix, prompt,
+          buf, slot + 2);
+      editor_set_status_message("%s", rendered);
+    } else {
+      editor_set_status_message("%s", prompt);
+    }
     editor_refresh_screen();
 
     int c = editor_read_key();
@@ -2020,7 +2035,7 @@ static char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
         bufsize *= 2;
         buf = xrealloc(buf, bufsize);
       }
-      buf[buflen++] = c;
+      buf[buflen++] = (char)c;
       buf[buflen] = '\0';
     }
 
@@ -2188,7 +2203,7 @@ static void editor_find(void) {
 
   const char *term = query[0] != '\0' ? query : last_query;
   int excl = (query[0] == '\0');
-  if (editor_search_string(term, strlen(term), 1, excl, SEARCH_WRAP))
+  if (editor_search_string(term, (int)strlen(term), 1, excl, SEARCH_WRAP))
     editor_set_status_message("Found");
   else
     editor_set_status_message("Not found. Press Ctrl-N to search again");
@@ -2200,7 +2215,7 @@ static void editor_find_next(void) {
     editor_set_status_message("No previous search. Press Ctrl-F to search");
     return;
   }
-  if (editor_search_string(last_query, strlen(last_query), 1, 1, SEARCH_WRAP))
+  if (editor_search_string(last_query, (int)strlen(last_query), 1, 1, SEARCH_WRAP))
     editor_set_status_message("Found (next)");
   else
     editor_set_status_message("Not found. Press Ctrl-P to search backward");
@@ -2211,7 +2226,7 @@ static void editor_find_prev(void) {
     editor_set_status_message("No previous search. Press Ctrl-F to search");
     return;
   }
-  if (editor_search_string(last_query, strlen(last_query), -1, 1, SEARCH_WRAP))
+  if (editor_search_string(last_query, (int)strlen(last_query), -1, 1, SEARCH_WRAP))
     editor_set_status_message("Found (previous)");
   else
     editor_set_status_message("Not found. Press Ctrl-N to search forward");
@@ -2816,7 +2831,7 @@ static void help_row(char *dst, int dstsz, const char *left, const char *right,
                      int colw, int gap, int total) {
   int rightw = total - colw - gap;
   if (rightw < 0) rightw = 0;
-  snprintf(dst, dstsz, "%-*.*s%*s%.*s",
+  snprintf(dst, (size_t)dstsz, "%-*.*s%*s%.*s",
            colw, colw, left, gap, "", rightw, right);
 }
 
@@ -2825,8 +2840,8 @@ static void help_centered(struct abuf *ab, const char *text, int row) {
   int pad = (E.screencols - (int)strlen(text)) / 2;
   if (pad < 0) pad = 0;
   snprintf(pos, sizeof(pos), "\x1b[%d;%dH", row, pad + 1);
-  ab_append(ab, pos, strlen(pos));
-  int len = strlen(text);
+  ab_append(ab, pos, (int)strlen(pos));
+  int len = (int)strlen(text);
   if (len > E.screencols) len = E.screencols;
   ab_append(ab, text, len);
   ab_append(ab, "\x1b[K", 3);
@@ -2901,8 +2916,8 @@ static void editor_help(void) {
       const char *R = (idx < nr) ? help_rcol[idx] : "";
       help_row(help_line, sizeof(help_line), L, R, colw, gap, E.screencols);
       snprintf(pos, sizeof(pos), "\x1b[%d;1H", content_top + k);
-      ab_append(&ab, pos, strlen(pos));
-      ab_append(&ab, help_line, strlen(help_line));
+      ab_append(&ab, pos, (int)strlen(pos));
+      ab_append(&ab, help_line, (int)strlen(help_line));
       ab_append(&ab, "\x1b[K", 3);
     }
 
@@ -3043,7 +3058,7 @@ static char *editor_open_dialog(void) {
         dshow++;
     }
     snprintf(pos, sizeof(pos), "\x1b[2;2H");
-    ab_append(&ab, pos, strlen(pos));
+    ab_append(&ab, pos, (int)strlen(pos));
     ab_append(&ab, dshow, (int)strlen(dshow));
     ab_append(&ab, "\x1b[K", 3);
 
@@ -3054,7 +3069,7 @@ static char *editor_open_dialog(void) {
       browser_fit(e->name, E.screencols - 2, name, sizeof(name));
       snprintf(pos, sizeof(pos), "\x1b[%d;2H%s", 4 + k,
                e == &ents[sel] ? "\x1b[7m" : "");
-      ab_append(&ab, pos, strlen(pos));
+      ab_append(&ab, pos, (int)strlen(pos));
       if (e->is_dir) {
         ab_append(&ab, name, (int)strlen(name));
         ab_append(&ab, "/", 1);
