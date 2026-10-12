@@ -149,7 +149,7 @@ static void ab_reserve(struct abuf *ab, int extra) {
 
 static void ab_append(struct abuf *ab, const char *s, int len) {
   ab_reserve(ab, len);
-  memcpy(&ab->b[ab->len], s, len);
+  memcpy(&ab->b[ab->len], s, (size_t)len);
   ab->len += len;
 }
 
@@ -687,7 +687,7 @@ static int read_byte(unsigned char *c) {
 static int last_key_shift = 0;
 
 static int editor_read_key(void) {
-  int nread;
+  ssize_t nread;
   unsigned char c;
   last_key_shift = 0;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
@@ -860,7 +860,8 @@ static void editor_insert_row(int at, char *s, size_t len) {
     E.rowcap = E.rowcap ? E.rowcap * 2 : 32;
     E.row = xrealloc(E.row, sizeof(erow) * (size_t)E.rowcap);
   }
-  memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+  memmove(&E.row[at + 1], &E.row[at],
+      sizeof(erow) * (size_t)(E.numrows - at));
 
   E.row[at].size = len;
   E.row[at].chars = chars;
@@ -882,7 +883,8 @@ static void editor_free_row(erow *row) {
 static void editor_delete_row(int at) {
   if (at < 0 || at >= E.numrows) return;
   editor_free_row(&E.row[at]);
-  memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+  memmove(&E.row[at], &E.row[at + 1],
+      sizeof(erow) * (size_t)(E.numrows - at - 1));
   E.numrows--;
   E.dirty++;
 }
@@ -890,9 +892,10 @@ static void editor_delete_row(int at) {
 static void editor_row_insert_char(erow *row, int at, int c) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = xrealloc(row->chars, (size_t)row->size + 2);
-  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+  memmove(&row->chars[at + 1], &row->chars[at],
+      (size_t)(row->size - at + 1));
   row->size++;
-  row->chars[at] = c;
+  row->chars[at] = (char)c;
   editor_update_row(row);
   E.dirty++;
 }
@@ -908,7 +911,8 @@ static void editor_row_append_string(erow *row, char *s, size_t len) {
 static void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = xrealloc(row->chars, (size_t)row->size + n + 1);
-  memmove(&row->chars[at + n], &row->chars[at], row->size - at + 1);
+  memmove(&row->chars[at + n], &row->chars[at],
+      (size_t)(row->size - at + 1));
   memcpy(&row->chars[at], s, n);
   row->size += n;
   editor_update_row(row);
@@ -917,7 +921,8 @@ static void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
 
 static void editor_row_delete_n(erow *row, int at, int n) {
   if (at < 0 || at + n > row->size) return;
-  memmove(&row->chars[at], &row->chars[at + n], row->size - at - n);
+  memmove(&row->chars[at], &row->chars[at + n],
+      (size_t)(row->size - at - n));
   row->size -= n;
   row->chars[row->size] = '\0';
   editor_update_row(row);
