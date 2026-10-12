@@ -25,6 +25,12 @@
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PRINTF_LIKE(fmtpos, argpos) __attribute__((format(printf, fmtpos, argpos)))
+#else
+#define PRINTF_LIKE(fmtpos, argpos)
+#endif
+
 enum editorKey {
   BACKSPACE = 127,
   ARROW_LEFT = 1000,
@@ -124,7 +130,7 @@ struct abuf {
 #define ABUF_INIT {NULL, 0, 0}
 
 _Noreturn void die(const char *s);
-void editor_set_status_message(const char *fmt, ...);
+void editor_set_status_message(const char *fmt, ...) PRINTF_LIKE(1, 2);
 void write_recovery_file(void);
 
 /* Make room for `extra` more bytes. Capacity doubles, so a frame costs a few
