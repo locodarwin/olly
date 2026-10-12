@@ -496,6 +496,13 @@ def test_save(tmpdir):
     finally:
         os.chmod(rod, 0o755)
 
+    missing = os.path.join(d, "does-not-exist", "file.txt")
+    out = run([OLLY, missing], ["X", SAVE])
+    check("non-permission temp-file failure preserves target",
+          os.path.exists(missing), False)
+    check("non-permission temp-file failure is reported",
+          any("Save failed" in m for m in status_lines(out)), True)
+
     print("\nsave: large files round-trip through the write buffer")
     # Save batches rows into a 64 KB buffer. Rows that exactly fill it, spill
     # one byte past it, and dwarf it take three different paths. Kept to a few
