@@ -130,9 +130,9 @@ struct abuf {
 
 #define ABUF_INIT {NULL, 0, 0}
 
-_Noreturn void die(const char *s);
-void editor_set_status_message(const char *fmt, ...) PRINTF_LIKE(1, 2);
-void write_recovery_file(void);
+static _Noreturn void die(const char *s);
+static void editor_set_status_message(const char *fmt, ...) PRINTF_LIKE(1, 2);
+static void write_recovery_file(void);
 
 /* Make room for `extra` more bytes. Capacity doubles, so a frame costs a few
  * reallocs in total; growing by exactly the appended length cost one realloc
@@ -147,7 +147,7 @@ static void ab_reserve(struct abuf *ab, int extra) {
   ab->cap = cap;
 }
 
-void ab_append(struct abuf *ab, const char *s, int len) {
+static void ab_append(struct abuf *ab, const char *s, int len) {
   ab_reserve(ab, len);
   memcpy(&ab->b[ab->len], s, len);
   ab->len += len;
@@ -160,7 +160,7 @@ static void ab_append_fill(struct abuf *ab, char c, int n) {
   ab->len += n;
 }
 
-_Noreturn void die(const char *s) {
+static _Noreturn void die(const char *s) {
   write_recovery_file();
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
@@ -307,7 +307,7 @@ static int mtime_eq(struct timespec a, struct timespec b) {
   return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
 }
 
-void saved_snapshot_free(void) {
+static void saved_snapshot_free(void) {
   int i;
   for (i = 0; i < saved_numrows; i++) {
     free(saved_rows[i].render);
@@ -318,7 +318,7 @@ void saved_snapshot_free(void) {
   saved_numrows = 0;
 }
 
-void saved_snapshot_take(void) {
+static void saved_snapshot_take(void) {
   int i;
   saved_snapshot_free();
   if (E.numrows == 0) return;
@@ -341,7 +341,7 @@ void saved_snapshot_take(void) {
   }
 }
 
-int editor_matches_saved(void) {
+static int editor_matches_saved(void) {
   int i;
   if (E.numrows != saved_numrows) return 0;
   for (i = 0; i < E.numrows; i++) {
@@ -353,7 +353,7 @@ int editor_matches_saved(void) {
   return 1;
 }
 
-void editor_recompute_dirty(void) {
+static void editor_recompute_dirty(void) {
   E.dirty = editor_matches_saved() ? 0 : 1;
 }
 
@@ -372,7 +372,7 @@ static int last_wscols;
 static char *welcome_buf;
 static int welcome_cap;
 
-void cache_invalidate(void) {
+static void cache_invalidate(void) {
   int i;
   for (i = 0; i < cache_alloc; i++) {
     free(cache_lines[i]);
@@ -382,7 +382,7 @@ void cache_invalidate(void) {
   }
 }
 
-void cache_ensure(int y) {
+static void cache_ensure(int y) {
   int i, na;
   char **nl;
   int *nlens, *ncaps;
@@ -404,7 +404,7 @@ void cache_ensure(int y) {
   cache_alloc = na;
 }
 
-void cache_line_draw(struct abuf *ab, int y, const char *s, int len, int force) {
+static void cache_line_draw(struct abuf *ab, int y, const char *s, int len, int force) {
   char pos[32];
   char *nb;
   cache_ensure(y);
@@ -430,7 +430,7 @@ void cache_line_draw(struct abuf *ab, int y, const char *s, int len, int force) 
 
 /* --- robust full write: retries on EINTR and loops over partial writes --- */
 
-int write_all(int fd, const void *p0, size_t n) {
+static int write_all(int fd, const void *p0, size_t n) {
   const char *p = p0;
   while (n > 0) {
     ssize_t w = write(fd, p, n);
@@ -491,7 +491,7 @@ static void recovery_set_meta_path(void) {
       recovery_path);
 }
 
-void build_recovery_path(void) {
+static void build_recovery_path(void) {
   recovery_path[0] = '\0';
   recovery_meta_path[0] = '\0';
   const char *test_dir = getenv("OLLY_RECOVERY_DIR");
@@ -555,7 +555,7 @@ static void clear_recovery_files(void) {
 }
 
 /* Best effort recovery checkpoint. */
-void write_recovery_file(void) {
+static void write_recovery_file(void) {
   if (!E.dirty || recovery_path[0] == '\0') return;
   int fd = open(recovery_path,
       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -584,7 +584,7 @@ void write_recovery_file(void) {
 /* Runs from atexit, where die() -- which calls exit() again -- would be
  * undefined behaviour. If the terminal is already gone there is nothing left
  * to restore anyway. */
-void disable_raw_mode(void) {
+static void disable_raw_mode(void) {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
 }
 
@@ -648,7 +648,7 @@ static void install_signal_handlers(void) {
   sigaction(SIGWINCH, &wsa, NULL);
 }
 
-void enable_raw_mode(void) {
+static void enable_raw_mode(void) {
   if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
   atexit(disable_raw_mode);
   install_signal_handlers();
@@ -686,7 +686,7 @@ static int read_byte(unsigned char *c) {
  * WINCH_KEY so the key enum stays a plain int. Reset on every call. */
 static int last_key_shift = 0;
 
-int editor_read_key(void) {
+static int editor_read_key(void) {
   int nread;
   unsigned char c;
   last_key_shift = 0;
@@ -771,7 +771,7 @@ int editor_read_key(void) {
   return '\x1b';
 }
 
-int get_cursor_position(int *rows, int *cols) {
+static int get_cursor_position(int *rows, int *cols) {
   char buf[32];
   unsigned int i = 0;
 
@@ -789,7 +789,7 @@ int get_cursor_position(int *rows, int *cols) {
   return 0;
 }
 
-int get_window_size(int *rows, int *cols) {
+static int get_window_size(int *rows, int *cols) {
   struct winsize ws;
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
     if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1;
@@ -801,7 +801,7 @@ int get_window_size(int *rows, int *cols) {
   }
 }
 
-void editor_update_row(erow *row) {
+static void editor_update_row(erow *row) {
   int tabs = 0;
   int j;
 
@@ -843,7 +843,7 @@ void editor_update_row(erow *row) {
   row->rsize = idx;
 }
 
-void editor_insert_row(int at, char *s, size_t len) {
+static void editor_insert_row(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
   /* Allocate the new row's text before touching the array. The memmove below
    * duplicates each shifted row's pointers into the next slot for an instant;
@@ -874,12 +874,12 @@ void editor_insert_row(int at, char *s, size_t len) {
   E.dirty++;
 }
 
-void editor_free_row(erow *row) {
+static void editor_free_row(erow *row) {
   if (row->rcap > 0) free(row->render);  /* rcap > 0 => render is owned */
   free(row->chars);
 }
 
-void editor_delete_row(int at) {
+static void editor_delete_row(int at) {
   if (at < 0 || at >= E.numrows) return;
   editor_free_row(&E.row[at]);
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
@@ -887,7 +887,7 @@ void editor_delete_row(int at) {
   E.dirty++;
 }
 
-void editor_row_insert_char(erow *row, int at, int c) {
+static void editor_row_insert_char(erow *row, int at, int c) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = xrealloc(row->chars, (size_t)row->size + 2);
   memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
@@ -897,7 +897,7 @@ void editor_row_insert_char(erow *row, int at, int c) {
   E.dirty++;
 }
 
-void editor_row_append_string(erow *row, char *s, size_t len) {
+static void editor_row_append_string(erow *row, char *s, size_t len) {
   row->chars = xrealloc(row->chars, (size_t)row->size + len + 1);
   memcpy(&row->chars[row->size], s, len);
   row->size += len;
@@ -905,15 +905,7 @@ void editor_row_append_string(erow *row, char *s, size_t len) {
   editor_update_row(row);
 }
 
-void editor_row_delete_char(erow *row, int at) {
-  if (at < 0 || at >= row->size) return;
-  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
-  row->size--;
-  editor_update_row(row);
-  E.dirty++;
-}
-
-void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
+static void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = xrealloc(row->chars, (size_t)row->size + n + 1);
   memmove(&row->chars[at + n], &row->chars[at], row->size - at + 1);
@@ -923,7 +915,7 @@ void editor_row_insert_n(erow *row, int at, const char *s, size_t n) {
   E.dirty++;
 }
 
-void editor_row_delete_n(erow *row, int at, int n) {
+static void editor_row_delete_n(erow *row, int at, int n) {
   if (at < 0 || at + n > row->size) return;
   memmove(&row->chars[at], &row->chars[at + n], row->size - at - n);
   row->size -= n;
@@ -932,7 +924,7 @@ void editor_row_delete_n(erow *row, int at, int n) {
   E.dirty++;
 }
 
-struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) {
+static struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) {
   struct uchange *u = xmalloc(sizeof(struct uchange));
   u->kind = kind;
   u->row = row;
@@ -962,9 +954,9 @@ struct uchange *uc_new(int kind, int row, int at, const char *text, size_t len) 
 static int undo_max_steps = UNDO_MAX_STEPS;
 
 static void undo_stack_trim(struct uchange **s, int *n, size_t *bytes);
-void uc_free(struct uchange *u);
+static void uc_free(struct uchange *u);
 
-void undo_push(struct uchange *u) {
+static void undo_push(struct uchange *u) {
   if (U.undo_n == U.undo_cap) {
     U.undo_cap = U.undo_cap ? U.undo_cap * 2 : 32;
     U.undo = xrealloc(U.undo, sizeof(struct uchange *) * (size_t)U.undo_cap);
@@ -974,7 +966,7 @@ void undo_push(struct uchange *u) {
   undo_stack_trim(U.undo, &U.undo_n, &U.undo_bytes);
 }
 
-void redo_push(struct uchange *u) {
+static void redo_push(struct uchange *u) {
   if (U.redo_n == U.redo_cap) {
     U.redo_cap = U.redo_cap ? U.redo_cap * 2 : 32;
     U.redo = xrealloc(U.redo, sizeof(struct uchange *) * (size_t)U.redo_cap);
@@ -984,7 +976,7 @@ void redo_push(struct uchange *u) {
   undo_stack_trim(U.redo, &U.redo_n, &U.redo_bytes);
 }
 
-void clear_redo(void) {
+static void clear_redo(void) {
   int i;
   for (i = 0; i < U.redo_n; i++) {
     free(U.redo[i]->text);
@@ -1003,12 +995,12 @@ void clear_redo(void) {
  * entries onto the redo stack, in that same pop order, leaves the redo
  * stack ready to replay the group in its original forward order. No extra
  * bookkeeping is needed for either direction. */
-void undo_group_begin(void) {
+static void undo_group_begin(void) {
   U.group_seq++;
   U.active_group = U.group_seq;
 }
 
-void undo_group_end(void) {
+static void undo_group_end(void) {
   U.active_group = 0;
   /* Without this, the next typed character could coalesce into the group's
    * trailing insert (see the !U.locked check in editor_insert_char),
@@ -1016,7 +1008,7 @@ void undo_group_end(void) {
   U.locked = 1;
 }
 
-void editor_free_undo_redo(void) {
+static void editor_free_undo_redo(void) {
   int i;
   for (i = 0; i < U.undo_n; i++) {
     free(U.undo[i]->text);
@@ -1039,7 +1031,7 @@ void editor_free_undo_redo(void) {
   U.locked = 0;
 }
 
-void uc_free(struct uchange *u) {
+static void uc_free(struct uchange *u) {
   free(u->text);
   free(u);
 }
@@ -1057,22 +1049,22 @@ static void undo_stack_trim(struct uchange **s, int *n, size_t *bytes) {
   }
 }
 
-void uc_do_insert(struct uchange *u) {
+static void uc_do_insert(struct uchange *u) {
   editor_row_insert_n(&E.row[u->row], u->at, u->text, u->len);
 }
 
-void uc_do_delete(struct uchange *u) {
+static void uc_do_delete(struct uchange *u) {
   editor_row_delete_n(&E.row[u->row], u->at, u->len);
 }
 
-void uc_do_join(struct uchange *u) {
+static void uc_do_join(struct uchange *u) {
   editor_row_append_string(&E.row[u->row], E.row[u->row + 1].chars,
       E.row[u->row + 1].size);
   editor_delete_row(u->row + 1);
   E.row[u->row].crlf = u->lo_crlf;  /* merged line keeps the lower ending */
 }
 
-void uc_do_split(struct uchange *u) {
+static void uc_do_split(struct uchange *u) {
   erow *row = &E.row[u->row];
   editor_insert_row(u->row + 1, row->chars + u->at, row->size - u->at);
   row = &E.row[u->row];
@@ -1083,15 +1075,15 @@ void uc_do_split(struct uchange *u) {
   editor_update_row(row);
 }
 
-void uc_do_newrow(struct uchange *u) {
+static void uc_do_newrow(struct uchange *u) {
   editor_insert_row(u->row, "", 0);
 }
 
-void uc_do_delrow(struct uchange *u) {
+static void uc_do_delrow(struct uchange *u) {
   editor_delete_row(u->row);
 }
 
-void uc_apply(struct uchange *u, int redo) {
+static void uc_apply(struct uchange *u, int redo) {
   if (redo) {
     switch (u->kind) {
       case UC_INSERT: uc_do_insert(u); break;
@@ -1116,7 +1108,7 @@ void uc_apply(struct uchange *u, int redo) {
   editor_recompute_dirty();
 }
 
-void editor_undo(void) {
+static void editor_undo(void) {
   if (U.undo_n == 0) {
     editor_set_status_message("Nothing to undo");
     return;
@@ -1136,7 +1128,7 @@ void editor_undo(void) {
   editor_set_status_message("Undo");
 }
 
-void editor_redo(void) {
+static void editor_redo(void) {
   if (U.redo_n == 0) {
     editor_set_status_message("Nothing to redo");
     return;
@@ -1158,7 +1150,7 @@ void editor_redo(void) {
  * tab stop, other characters advance by their display width (0 for combining
  * marks, 2 for wide glyphs). This is what positions the on-screen cursor and
  * drives horizontal scrolling. */
-int editor_row_cx_to_rx(erow *row, int cx) {
+static int editor_row_cx_to_rx(erow *row, int cx) {
   int rx = 0, j = 0;
   while (j < cx) {
     if (row->chars[j] == '\t') {
@@ -1225,7 +1217,7 @@ static int editor_render_byte_to_cx(erow *row, int rbyte) {
   return row->size;
 }
 
-void editor_insert_char(int c) {
+static void editor_insert_char(int c) {
   int pre_cx = E.cx, pre_cy = E.cy;
   if (E.cy == E.numrows) {
     editor_insert_row(E.numrows, "", 0);
@@ -1261,7 +1253,7 @@ void editor_insert_char(int c) {
   U.locked = 0;
 }
 
-void editor_insert_newline(void) {
+static void editor_insert_newline(void) {
   if (E.cx == 0) {
     struct uchange *u = uc_new(UC_NEWROW, E.cy, 0, "", 0);
     u->cx0 = 0;
@@ -1296,7 +1288,7 @@ void editor_insert_newline(void) {
   U.locked = 0;
 }
 
-void editor_delete_char(void) {
+static void editor_delete_char(void) {
   if (E.cy > E.numrows) return;
   int pre_cx = E.cx, pre_cy = E.cy;
 
@@ -1366,7 +1358,7 @@ void editor_delete_char(void) {
   U.locked = 0;
 }
 
-void editor_del_char(void) {
+static void editor_del_char(void) {
   if (E.cy >= E.numrows) return;
   int pre_cx = E.cx, pre_cy = E.cy;
   erow *row = &E.row[E.cy];
@@ -1416,7 +1408,7 @@ void editor_del_char(void) {
   U.locked = 0;
 }
 
-void editor_move_cursor(int key) {
+static void editor_move_cursor(int key) {
   erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
 
   switch (key) {
@@ -1457,7 +1449,7 @@ void editor_move_cursor(int key) {
   }
 }
 
-void editor_scroll(void) {
+static void editor_scroll(void) {
   E.rx = 0;
   if (E.cy < E.numrows) {
     E.rx = editor_row_cx_to_rx(&E.row[E.cy], E.cx);
@@ -1825,7 +1817,7 @@ static void editor_draw_text_row(struct abuf *ab, int y, erow *row,
   cache_line_draw(ab, y, drawbuf, p, 0);
 }
 
-void editor_draw_rows(struct abuf *ab) {
+static void editor_draw_rows(struct abuf *ab) {
   int y;
   int gw = E.gutter_w;
   int text_cols = TEXT_COLS();
@@ -1881,7 +1873,7 @@ void editor_draw_rows(struct abuf *ab) {
   }
 }
 
-void editor_draw_status_bar(struct abuf *ab) {
+static void editor_draw_status_bar(struct abuf *ab) {
   char rp[32];
   int rplen = snprintf(rp, sizeof(rp), "\x1b[%d;1H", E.screenrows + 1);
   ab_append(ab, rp, rplen);
@@ -1915,7 +1907,7 @@ void editor_draw_status_bar(struct abuf *ab) {
   ab_append(ab, "\x1b[m", 3);
 }
 
-void editor_draw_message_bar(struct abuf *ab) {
+static void editor_draw_message_bar(struct abuf *ab) {
   char rp[32];
   int rplen = snprintf(rp, sizeof(rp), "\x1b[%d;1H", E.screenrows + 2);
   ab_append(ab, rp, rplen);
@@ -1926,7 +1918,7 @@ void editor_draw_message_bar(struct abuf *ab) {
     ab_append(ab, E.statusmsg, msglen);
 }
 
-void editor_refresh_screen(void) {
+static void editor_refresh_screen(void) {
   int wsrows, wscols;
   /* On a failed size query, keep drawing at the last known size rather than
    * with whatever half-set values the query left behind. */
@@ -1983,7 +1975,7 @@ void editor_refresh_screen(void) {
   free(ab.b);
 }
 
-void editor_set_status_message(const char *fmt, ...) {
+static void editor_set_status_message(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
@@ -1991,7 +1983,7 @@ void editor_set_status_message(const char *fmt, ...) {
   E.statusmsg_time = time(NULL);
 }
 
-char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
+static char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
   size_t bufsize = 128;
   char *buf = xmalloc(bufsize);
   size_t buflen = 0;
@@ -2177,7 +2169,7 @@ static int editor_search_string(const char *query, int qlen, int dir,
   return 0;
 }
 
-void editor_find(void) {
+static void editor_find(void) {
   char *query = editor_prompt("Search: %s (ESC to cancel, Enter to find)", NULL);
   if (query == NULL) return;
 
@@ -2198,7 +2190,7 @@ void editor_find(void) {
   free(query);
 }
 
-void editor_find_next(void) {
+static void editor_find_next(void) {
   if (last_query == NULL) {
     editor_set_status_message("No previous search. Press Ctrl-F to search");
     return;
@@ -2209,7 +2201,7 @@ void editor_find_next(void) {
     editor_set_status_message("Not found. Press Ctrl-P to search backward");
 }
 
-void editor_find_prev(void) {
+static void editor_find_prev(void) {
   if (last_query == NULL) {
     editor_set_status_message("No previous search. Press Ctrl-F to search");
     return;
@@ -2220,7 +2212,7 @@ void editor_find_prev(void) {
     editor_set_status_message("Not found. Press Ctrl-N to search forward");
 }
 
-void editor_toggle_case_sensitive(void) {
+static void editor_toggle_case_sensitive(void) {
   search_case_sensitive = !search_case_sensitive;
   editor_set_status_message("Search is now case-%s",
       search_case_sensitive ? "sensitive" : "insensitive");
@@ -2237,7 +2229,7 @@ static int editor_match_char_len(erow *row, int cx, int qlen) {
   return cx_end - cx;
 }
 
-void editor_goto_line(void) {
+static void editor_goto_line(void) {
   char *input = editor_prompt("Go to line: %s (ESC to cancel)", NULL);
   if (input == NULL) return;
 
@@ -2262,7 +2254,7 @@ void editor_goto_line(void) {
   editor_set_status_message("Ln %d", E.cy + 1);
 }
 
-void editor_replace(void) {
+static void editor_replace(void) {
   char *query = editor_prompt("Replace - search: %s (ESC to cancel)", NULL);
   if (query == NULL) return;
   if (query[0] == '\0') {
@@ -2406,7 +2398,7 @@ static mode_t default_file_mode(void) {
   return 0666 & ~um;
 }
 
-void editor_save(void) {
+static void editor_save(void) {
   if (E.filename == NULL) {
     char *name = editor_prompt("Save as: %s (ESC to cancel)", NULL);
     if (name == NULL) {
@@ -2574,7 +2566,7 @@ void editor_save(void) {
 /* Read every line of fp into the (already empty) buffer and set the end-of-
  * line style flags from what was seen. Returns -1 if the stream ended in a
  * read error rather than at end of file. */
-int editor_fill_rows(FILE *fp) {
+static int editor_fill_rows(FILE *fp) {
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
@@ -2612,7 +2604,7 @@ int editor_fill_rows(FILE *fp) {
   return 0;
 }
 
-void editor_open(char *filename) {
+static void editor_open(char *filename) {
   free(E.filename);
   E.filename = xstrdup(filename);
   build_recovery_path();
@@ -2670,7 +2662,7 @@ static int recovery_target_matches(void) {
  * by the usual save/quit unlink exactly as it was before this prompt existed.
  * Only files named on the command line are offered: an anonymous buffer's
  * recovery file (olly-recover.PID) has no obvious owner to prompt for. */
-void editor_check_recovery(void) {
+static void editor_check_recovery(void) {
   if (E.filename == NULL || recovery_path[0] == '\0') return;
   struct stat st;
   if (stat(recovery_path, &st) == -1 || !S_ISREG(st.st_mode) ||
@@ -2852,7 +2844,7 @@ static void help_refresh_size(void) {
   E.screencols = wscols;
 }
 
-void editor_help(void) {
+static void editor_help(void) {
   int scroll = 0;
   for (;;) {
     /* Recompute the whole layout from the live terminal size on every pass, so
@@ -3149,7 +3141,7 @@ static void editor_switch_file(char *path) {
   editor_set_status_message("Opened %s - %d lines", display_name, E.numrows);
 }
 
-void editor_process_keypress(void) {
+static void editor_process_keypress(void) {
   static int quit_times = KILO_QUIT_TIMES;
   int c = editor_read_key();
   int shift = last_key_shift;
@@ -3353,7 +3345,7 @@ void editor_process_keypress(void) {
   quit_times = KILO_QUIT_TIMES;
 }
 
-void editor_cleanup(void) {
+static void editor_cleanup(void) {
   int i;
   for (i = 0; i < E.numrows; i++) editor_free_row(&E.row[i]);
   free(E.row);
@@ -3385,7 +3377,7 @@ void editor_cleanup(void) {
   E.filename = NULL;
 }
 
-void init_editor(void) {
+static void init_editor(void) {
   E.cx = 0;
   E.cy = 0;
   E.rx = 0;
