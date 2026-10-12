@@ -47,6 +47,16 @@ SH_HOME, SH_END = "\x1b[1;2H", "\x1b[1;2F"
 COPY, CUT, PASTE = "\x03", "\x18", "\x16"
 
 
+def recovery_path(path):
+    h = 1469598103934665603
+    for byte in os.fsencode(path):
+        h ^= byte
+        h = (h * 1099511628211) & ((1 << 64) - 1)
+    return os.path.join(os.environ["OLLY_RECOVERY_DIR"],
+                        "%s-%016x.olly-recover" %
+                        (os.path.basename(path), h))
+
+
 def run_interleaved(argv, before_keys, touch, after_keys, rows=24, cols=80):
     """Like pty_harness.run, but calls touch() between the two key batches --
     used to simulate another process modifying the file while olly still has
@@ -100,7 +110,7 @@ def run_interleaved(argv, before_keys, touch, after_keys, rows=24, cols=80):
     # checkpoint to keep one scenario from becoming the next one's input.
     if len(argv) > 1:
         try:
-            os.unlink(argv[1] + ".olly-recover")
+            os.unlink(recovery_path(argv[1]))
         except FileNotFoundError:
             pass
     try:
@@ -1041,7 +1051,7 @@ def test_recovery(tmpdir):
     path = os.path.join(tmpdir, "doc.txt")
     with open(path, "w") as fh:
         fh.write("original\n")
-    rec = path + ".olly-recover"
+    rec = recovery_path(path)
 
     # Regression/feature: work used to vanish when a signal killed the editor.
     run_until_signal([OLLY, path], signal.SIGTERM, keys=["HELLO"])
@@ -1066,7 +1076,7 @@ def test_recovery(tmpdir):
 def test_recovery_prompt(tmpdir):
     print("\nrecovery: startup offers to restore data left by a crash")
     path = os.path.join(tmpdir, "doc.txt")
-    rec = path + ".olly-recover"
+    rec = recovery_path(path)
 
     def setup():
         with open(path, "w") as fh:

@@ -493,8 +493,9 @@ void build_recovery_path(void) {
     }
     const char *name = E.filename ? strrchr(E.filename, '/') : NULL;
     name = name ? name + 1 : "anonymous";
-    snprintf(recovery_path, sizeof(recovery_path), "%s/%s.olly-recover",
-        test_dir, name);
+    uint64_t hash = recovery_hash(E.filename ? E.filename : "anonymous");
+    snprintf(recovery_path, sizeof(recovery_path),
+        "%s/%s-%016" PRIx64 ".olly-recover", test_dir, name, hash);
     return;
   }
 
