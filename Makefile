@@ -35,7 +35,10 @@ test: olly
 test-oom: olly
 	python3 tests/oom_sweep.py ./olly
 
+bench: olly
+	python3 tests/bench_olly.py ./olly
+
 clean:
 	rm -f olly editor
 
-.PHONY: clean install uninstall test test-oom
+.PHONY: clean install uninstall test test-oom bench

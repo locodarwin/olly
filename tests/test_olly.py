@@ -1060,7 +1060,10 @@ def test_recovery(tmpdir):
         with open(rec) as fh:
             check("recovery file holds the unsaved buffer",
                   fh.read(), "HELLOoriginal\n")
+        with open(rec + ".meta") as fh:
+            check("recovery metadata names the target", fh.read(), path + "\n")
         os.remove(rec)
+        os.remove(rec + ".meta")
 
     with open(rec, "w") as fh:
         fh.write("stale\n")
@@ -1104,6 +1107,15 @@ def test_recovery_prompt(tmpdir):
           b"on disk" in out, True)
     check("a dismissed recovery file is removed on quit",
           os.path.exists(rec), False)
+
+    setup()
+    with open(rec + ".meta", "w") as fh:
+        fh.write(os.path.join(tmpdir, "other.txt") + "\n")
+    out = run([OLLY, path], [], status=True)[0]
+    check("mismatched recovery metadata is ignored",
+          any("R = restore" in m for m in status_lines(out)), False)
+    os.remove(rec)
+    os.remove(rec + ".meta")
 
     setup()
     out = run([OLLY, path], ["r", SAVE, "\x11"])

@@ -451,7 +451,8 @@ int write_all(int fd, const void *p0, size_t n) {
  * ahead of time, in normal context, because the signal path may run only
  * async-signal-safe code. --- */
 
-static char recovery_path[4096];
+static char recovery_path[PATH_MAX + 64];
+static char recovery_meta_path[PATH_MAX + 64];
 
 static int ensure_private_dir(const char *dir) {
   struct stat st;
@@ -481,7 +482,18 @@ static uint64_t recovery_hash(const char *s) {
   return h;
 }
 
+static void recovery_set_meta_path(void) {
+  if (recovery_path[0] == '\0') {
+    recovery_meta_path[0] = '\0';
+    return;
+  }
+  snprintf(recovery_meta_path, sizeof(recovery_meta_path), "%s.meta",
+      recovery_path);
+}
+
 void build_recovery_path(void) {
+  recovery_path[0] = '\0';
+  recovery_meta_path[0] = '\0';
   const char *test_dir = getenv("OLLY_RECOVERY_DIR");
   if (test_dir != NULL && *test_dir != '\0') {
     /* Test isolation hook: callers provide a private temporary directory,
@@ -496,6 +508,7 @@ void build_recovery_path(void) {
     uint64_t hash = recovery_hash(E.filename ? E.filename : "anonymous");
     snprintf(recovery_path, sizeof(recovery_path),
         "%s/%s-%016" PRIx64 ".olly-recover", test_dir, name, hash);
+    recovery_set_meta_path();
     return;
   }
 
@@ -533,11 +546,15 @@ void build_recovery_path(void) {
   else
     snprintf(recovery_path, sizeof(recovery_path), "%s/olly-%ld.recover",
         dir, (long)getpid());
+  recovery_set_meta_path();
 }
 
-/* Best effort, and safe to call from a signal handler: only open/write/fsync/
- * close and plain memory reads. Reading E.row while it is mid-mutation can at
- * worst drop or duplicate a few bytes, which beats losing the whole buffer. */
+static void clear_recovery_files(void) {
+  if (recovery_path[0] != '\0') unlink(recovery_path);
+  if (recovery_meta_path[0] != '\0') unlink(recovery_meta_path);
+}
+
+/* Best effort recovery checkpoint. */
 void write_recovery_file(void) {
   if (!E.dirty || recovery_path[0] == '\0') return;
   int fd = open(recovery_path,
@@ -550,6 +567,18 @@ void write_recovery_file(void) {
   }
   fsync(fd);
   close(fd);
+  if (E.filename != NULL && recovery_meta_path[0] != '\0') {
+    int meta = open(recovery_meta_path,
+        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (meta != -1) {
+      if (write_all(meta, E.filename, strlen(E.filename)) == -1 ||
+          write_all(meta, "\n", 1) == -1) {
+        unlink(recovery_meta_path);
+      }
+      fsync(meta);
+      close(meta);
+    }
+  }
 }
 
 /* Runs from atexit, where die() -- which calls exit() again -- would be
@@ -1980,7 +2009,7 @@ char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
         buf[buflen] = '\0';
       }
     } else if (c == '\x1b') {
-      editor_set_status_message("");
+      editor_set_status_message("%s", "");
       if (callback) callback(buf, c);
       free(buf);
       return NULL;
@@ -2452,6 +2481,16 @@ void editor_save(void) {
   int fd = mkstemp(tmp);
 
   if (fd == -1) {
+    int temp_errno = errno;
+    /* Only use the historical in-place fallback when the directory itself
+     * prevents a sibling temp file. Resource exhaustion, I/O errors, and
+     * unknown failures must preserve the target rather than truncating it. */
+    if (temp_errno != EACCES && temp_errno != EROFS) {
+      editor_set_status_message("Save failed: %s", strerror(temp_errno));
+      free(tmp);
+      free(resolved);
+      return;
+    }
     /* No room to create a sibling temp file -- typically a writable file in
      * a read-only directory. Fall back to rewriting the file in place, which
      * still saves the user's work, but say so: this write is not atomic. */
@@ -2480,7 +2519,7 @@ void editor_save(void) {
     saved_snapshot_take();
     have_disk_mtime = have_after;
     if (have_after) on_disk_mtime = st_after.st_mtim;
-    if (recovery_path[0] != '\0') unlink(recovery_path);
+    clear_recovery_files();
     return;
   }
 
@@ -2529,7 +2568,7 @@ void editor_save(void) {
   saved_snapshot_take();
   have_disk_mtime = have_after;
   if (have_after) on_disk_mtime = st_after.st_mtim;
-  if (recovery_path[0] != '\0') unlink(recovery_path);
+  clear_recovery_files();
 }
 
 /* Read every line of fp into the (already empty) buffer and set the end-of-
@@ -2607,6 +2646,20 @@ void editor_open(char *filename) {
   saved_snapshot_take();
 }
 
+static int recovery_target_matches(void) {
+  if (E.filename == NULL || recovery_meta_path[0] == '\0') return 1;
+  FILE *meta = fopen(recovery_meta_path, "r");
+  if (meta == NULL) return errno == ENOENT;
+  char target[PATH_MAX];
+  if (fgets(target, sizeof(target), meta) == NULL) {
+    fclose(meta);
+    return 0;
+  }
+  fclose(meta);
+  target[strcspn(target, "\n")] = '\0';
+  return strcmp(target, E.filename) == 0;
+}
+
 /* Startup recovery UX: when the file being opened has a recovery file left by
  * a crashed session, offer its contents before this session's own save/quit
  * cleanup removes it. R replaces the buffer with the recovered contents and
@@ -2620,7 +2673,8 @@ void editor_open(char *filename) {
 void editor_check_recovery(void) {
   if (E.filename == NULL || recovery_path[0] == '\0') return;
   struct stat st;
-  if (stat(recovery_path, &st) == -1 || !S_ISREG(st.st_mode)) return;
+  if (stat(recovery_path, &st) == -1 || !S_ISREG(st.st_mode) ||
+      !recovery_target_matches()) return;
 
   editor_set_status_message(
       "Unsaved changes from a crashed session. R = restore | any key = drop");
@@ -3120,7 +3174,7 @@ void editor_process_keypress(void) {
       }
       write_all(STDOUT_FILENO, "\x1b[2J", 4);
       write_all(STDOUT_FILENO, "\x1b[H", 3);
-      if (recovery_path[0] != '\0') unlink(recovery_path);
+      clear_recovery_files();
       exit(0);
       break;
 
