@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -452,13 +453,85 @@ int write_all(int fd, const void *p0, size_t n) {
 
 static char recovery_path[4096];
 
+static int ensure_private_dir(const char *dir) {
+  struct stat st;
+  if (stat(dir, &st) == 0)
+    return S_ISDIR(st.st_mode) && st.st_uid == getuid() &&
+        (st.st_mode & 0077) == 0 ? 0 : -1;
+  if (errno != ENOENT) return -1;
+
+  char parent[PATH_MAX];
+  snprintf(parent, sizeof(parent), "%s", dir);
+  char *slash = strrchr(parent, '/');
+  if (slash != NULL && slash != parent) {
+    *slash = '\0';
+    if (ensure_private_dir(parent) == -1) return -1;
+  }
+  if (mkdir(dir, 0700) == -1 && errno != EEXIST) return -1;
+  if (stat(dir, &st) == -1 || !S_ISDIR(st.st_mode)) return -1;
+  return st.st_uid == getuid() && (st.st_mode & 0077) == 0 ? 0 : -1;
+}
+
+static uint64_t recovery_hash(const char *s) {
+  uint64_t h = UINT64_C(1469598103934665603);
+  while (*s != '\0') {
+    h ^= (unsigned char)*s++;
+    h *= UINT64_C(1099511628211);
+  }
+  return h;
+}
+
 void build_recovery_path(void) {
+  const char *test_dir = getenv("OLLY_RECOVERY_DIR");
+  if (test_dir != NULL && *test_dir != '\0') {
+    /* Test isolation hook: callers provide a private temporary directory,
+     * while retaining the historical basename so existing recovery tests can
+     * inspect the file directly. Production never uses this branch. */
+    if (ensure_private_dir(test_dir) == -1) {
+      recovery_path[0] = '\0';
+      return;
+    }
+    const char *name = E.filename ? strrchr(E.filename, '/') : NULL;
+    name = name ? name + 1 : "anonymous";
+    snprintf(recovery_path, sizeof(recovery_path), "%s/%s.olly-recover",
+        test_dir, name);
+    return;
+  }
+
+  char dir[PATH_MAX];
+  const char *state = getenv("XDG_STATE_HOME");
+  const char *home = getenv("HOME");
+  if (state != NULL && *state != '\0')
+    snprintf(dir, sizeof(dir), "%s/olly/recovery", state);
+  else if (home != NULL && *home != '\0')
+    snprintf(dir, sizeof(dir), "%s/.local/state/olly/recovery", home);
+  else {
+    recovery_path[0] = '\0';
+    return;
+  }
+
+  char parent[PATH_MAX];
+  snprintf(parent, sizeof(parent), "%s", dir);
+  char *slash = strrchr(parent, '/');
+  if (slash != NULL) {
+    *slash = '\0';
+    if (ensure_private_dir(parent) == -1) {
+      recovery_path[0] = '\0';
+      return;
+    }
+  }
+  if (ensure_private_dir(dir) == -1) {
+    recovery_path[0] = '\0';
+    return;
+  }
+
+  uint64_t hash = recovery_hash(E.filename ? E.filename : "anonymous");
   if (E.filename != NULL)
-    snprintf(recovery_path, sizeof(recovery_path), "%s.olly-recover",
-        E.filename);
+    snprintf(recovery_path, sizeof(recovery_path), "%s/olly-%016" PRIx64 ".recover",
+        dir, hash);
   else
-    snprintf(recovery_path, sizeof(recovery_path), "olly-recover.%ld",
-        (long)getpid());
+    snprintf(recovery_path, sizeof(recovery_path), "%s/olly-%ld.recover",
+        dir, (long)getpid());
 }
 
 /* Best effort, and safe to call from a signal handler: only open/write/fsync/

@@ -1325,6 +1325,7 @@ def main():
         sys.exit("no olly binary at %s -- run make first" % OLLY)
 
     tmpdir = tempfile.mkdtemp(prefix="olly-tests-")
+    os.environ["OLLY_RECOVERY_DIR"] = tmpdir
     try:
         test_keys(tmpdir)
         test_tab(tmpdir)
