@@ -36,7 +36,8 @@ enum editorKey {
   END_KEY,
   PAGE_UP,
   PAGE_DOWN,
-  WINCH_KEY  /* not a real keystroke -- a SIGWINCH woke the read loop */
+  WINCH_KEY,  /* not a real keystroke -- a SIGWINCH woke the read loop */
+  FATAL_KEY   /* a fatal signal is completed in normal context */
 };
 
 typedef struct erow {
@@ -482,11 +483,25 @@ void disable_raw_mode(void) {
  * `kill` used to leave the terminal in raw mode, with no echo and no line
  * editing. Restore it, then re-raise so the process still dies by the signal.
  * Only async-signal-safe calls belong here. */
+static volatile sig_atomic_t fatal_signal = 0;
+
 static void handle_fatal_signal(int sig) {
   static const char reset[] = "\x1b[?25h\x1b[2J\x1b[H";
-  write_recovery_file();
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
+  /* Recovery is completed in normal context after this handler returns.
+   * Calling the serializer here would run open(), fsync(), and application
+   * code from a signal handler, which is not async-signal-safe and can
+   * deadlock if the signal interrupted libc or a mutation. */
+  fatal_signal = sig;
   write(STDOUT_FILENO, reset, sizeof(reset) - 1);
+}
+
+static void finish_fatal_signal(void) {
+  int sig = fatal_signal;
+  if (sig == 0) return;
+  fatal_signal = 0;
+  disable_raw_mode();
+  write_recovery_file();
+  signal(sig, SIG_DFL);
   raise(sig);
 }
 
@@ -567,6 +582,7 @@ int editor_read_key(void) {
   unsigned char c;
   last_key_shift = 0;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (fatal_signal) return FATAL_KEY;
     if (nread == -1 && errno != EAGAIN) die("read");
     /* VMIN=0/VTIME=1 already wakes this loop roughly every 100ms even with
      * no key pressed; piggyback on that wakeup to notice a resize instead of
@@ -2774,7 +2790,7 @@ void editor_help(void) {
      * re-reads the size and re-lays the screen out at the new dimensions. */
     if (c == WINCH_KEY) continue;
     if (maxscroll == 0) break;
-    int ns = scroll;
+    int ns;
     if (c == ARROW_DOWN) ns = scroll + 1;
     else if (c == ARROW_UP) ns = scroll - 1;
     else if (c == PAGE_DOWN) ns = scroll + view_h;
@@ -2932,7 +2948,7 @@ static char *editor_open_dialog(void) {
 
     int c = editor_read_key();
     if (c == WINCH_KEY) continue;
-    int ns = sel;
+    int ns;
     if (c == ARROW_DOWN || c == CTRL_KEY('n')) ns = sel + 1;
     else if (c == ARROW_UP || c == CTRL_KEY('p')) ns = sel - 1;
     else if (c == PAGE_DOWN) ns = sel + view_h;
@@ -2993,8 +3009,10 @@ static void editor_switch_file(char *path) {
   E.final_newline = 1;
   editor_open(path);
   free(path);
-  editor_set_status_message("Opened %s - %d lines",
-      E.filename ? E.filename : "(unnamed)", E.numrows);
+  const char *display_name = E.filename ? strrchr(E.filename, '/') : NULL;
+  display_name = display_name ? display_name + 1 :
+      (E.filename ? E.filename : "(unnamed)");
+  editor_set_status_message("Opened %s - %d lines", display_name, E.numrows);
 }
 
 void editor_process_keypress(void) {
@@ -3159,6 +3177,10 @@ void editor_process_keypress(void) {
       force_full = 1;
       editor_set_status_message("Line numbers: %s", E.linenum ? "on" : "off");
       break;
+
+    case FATAL_KEY:
+      finish_fatal_signal();
+      return;
 
     case WINCH_KEY:
       /* Not a keystroke -- just loop back so the next editor_refresh_screen
@@ -3339,9 +3361,13 @@ int main(int argc, char *argv[]) {
    * an answer. */
   editor_check_recovery();
 
-  if (num_extra > 0)
-    editor_set_status_message("Warning: ignored %d extra argument%s (e.g. %s)",
-        num_extra, num_extra > 1 ? "s" : "", first_extra);
+  if (num_extra > 0) {
+    const char *extra_name = strrchr(first_extra, '/');
+    extra_name = extra_name ? extra_name + 1 : first_extra;
+    editor_set_status_message(
+        "Warning: ignored %d extra argument%s (e.g. %s)",
+        num_extra, num_extra > 1 ? "s" : "", extra_name);
+  }
 
   /* Paint the first frame up front. The loop below reads a key before it
    * paints, so without this the screen stayed blank until the first
@@ -3350,6 +3376,7 @@ int main(int argc, char *argv[]) {
 
   while (1) {
     editor_process_keypress();
+    if (fatal_signal) finish_fatal_signal();
     editor_refresh_screen();
   }
 

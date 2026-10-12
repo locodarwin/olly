@@ -94,6 +94,15 @@ def run_interleaved(argv, before_keys, touch, after_keys, rows=24, cols=80):
     except OSError:
         pass
     os.waitpid(pid, 0)
+    # run_interleaved force-kills the child after each scenario. A normal
+    # crash leaves Olly's recovery checkpoint intentionally, but this helper
+    # runs independent scenarios in one temporary directory, so remove the
+    # checkpoint to keep one scenario from becoming the next one's input.
+    if len(argv) > 1:
+        try:
+            os.unlink(argv[1] + ".olly-recover")
+        except FileNotFoundError:
+            pass
     try:
         os.close(fd)
     except OSError:
