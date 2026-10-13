@@ -42,10 +42,14 @@ strict:
 	$(MAKE) clean
 	$(MAKE) CC=clang CFLAGS='-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wstrict-prototypes -Wmissing-prototypes -O2 -std=c11 -g'
 
+bench-core:
+	$(CC) $(CFLAGS) tests/bench_core.c -o tests/bench_core
+	tests/bench_core
+
 bench: olly
 	python3 tests/bench_olly.py ./olly
 
 clean:
 	rm -f olly editor
 
-.PHONY: clean install uninstall test test-oom test-io strict bench
+.PHONY: clean install uninstall test test-oom test-io strict bench-core bench
