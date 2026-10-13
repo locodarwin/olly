@@ -21,3 +21,4 @@ jobs:
       - run: make test-oom
       # Failure-injection check for the durable-save fsync path.
       - run: make test-io
+      - run: make bench-core
